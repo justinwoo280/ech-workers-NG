@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="background">#1E1E1E</color>
+    <color name="surface">#2D2D30</color>
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#AAAAAA</color>
+    <color name="accent">#F6821F</color>
+    <color name="connect_button">#4CAF50</color>
+    <color name="disconnect_button">#F44336</color>
+    <color name="error_text">#F44336</color>
+    <color name="success_text">#4CAF50</color>
+</resources>
