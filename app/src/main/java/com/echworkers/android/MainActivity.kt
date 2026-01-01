@@ -1,8 +1,12 @@
 package com.echworkers.android
 
 import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.widget.Toast
@@ -25,6 +29,22 @@ class MainActivity : AppCompatActivity() {
 
     private var localProxyAddr: String? = null
 
+    private val vpnStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.getStringExtra(EchVpnService.EXTRA_STATE)) {
+                "connected" -> {
+                    localProxyAddr = intent.getStringExtra(EchVpnService.EXTRA_PROXY_ADDR)
+                    localProxyAddr?.let { addr ->
+                        viewModel.testConnection(addr)
+                    }
+                }
+                "disconnected" -> {
+                    localProxyAddr = null
+                }
+            }
+        }
+    }
+
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -44,6 +64,14 @@ class MainActivity : AppCompatActivity() {
 
         setupUI()
         observeViewModel()
+        
+        // 注册 VPN 状态广播接收器
+        val filter = IntentFilter(EchVpnService.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(vpnStateReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(vpnStateReceiver, filter)
+        }
     }
 
     private fun setupUI() {
@@ -184,10 +212,8 @@ class MainActivity : AppCompatActivity() {
         }
         startService(intent)
         viewModel.setConnected(true)
-
-        // 连接后自动测试
-        localProxyAddr = "127.0.0.1:10808"
-        viewModel.testConnection(localProxyAddr!!)
+        
+        // 代理地址将通过广播接收，然后自动测试
     }
 
     private fun stopVpn() {
@@ -201,6 +227,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        unregisterReceiver(vpnStateReceiver)
         viewModel.saveConfig()
     }
 }

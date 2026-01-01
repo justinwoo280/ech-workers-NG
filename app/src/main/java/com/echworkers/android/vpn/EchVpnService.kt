@@ -23,6 +23,7 @@ class EchVpnService : VpnService(), core.SocketProtector {
         const val TAG = "EchVpnService"
         const val ACTION_CONNECT = "com.echworkers.android.CONNECT"
         const val ACTION_DISCONNECT = "com.echworkers.android.DISCONNECT"
+        const val ACTION_STATE_CHANGED = "com.echworkers.android.VPN_STATE_CHANGED"
         const val EXTRA_SERVER_ADDR = "server_addr"
         const val EXTRA_SERVER_IP = "server_ip"
         const val EXTRA_TOKEN = "token"
@@ -30,6 +31,8 @@ class EchVpnService : VpnService(), core.SocketProtector {
         const val EXTRA_ENABLE_YAMUX = "enable_yamux"
         const val EXTRA_ECH_DOMAIN = "ech_domain"
         const val EXTRA_ECH_DOH_SERVER = "ech_doh_server"
+        const val EXTRA_PROXY_ADDR = "proxy_addr"
+        const val EXTRA_STATE = "state"
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "ech_vpn_channel"
@@ -70,21 +73,36 @@ class EchVpnService : VpnService(), core.SocketProtector {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CONNECT -> {
-                val serverAddr = intent.getStringExtra(EXTRA_SERVER_ADDR) ?: ""
-                val serverIp = intent.getStringExtra(EXTRA_SERVER_IP) ?: ""
-                val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
-                val enableEch = intent.getBooleanExtra(EXTRA_ENABLE_ECH, true)
-                val enableYamux = intent.getBooleanExtra(EXTRA_ENABLE_YAMUX, true)
-                val echDomain = intent.getStringExtra(EXTRA_ECH_DOMAIN) ?: ""
-                val echDohServer = intent.getStringExtra(EXTRA_ECH_DOH_SERVER) ?: ""
-
-                connect(serverAddr, serverIp, token, enableEch, enableYamux, echDomain, echDohServer)
+                // 如果已经在连接中，先断开
+                if (proxyJob?.isActive == true) {
+                    Log.w(TAG, "已有连接正在运行，先断开旧连接")
+                    disconnect()
+                    // 等待断开完成后再连接
+                    scope.launch {
+                        delay(1000)
+                        startConnection(intent)
+                    }
+                } else {
+                    startConnection(intent)
+                }
             }
             ACTION_DISCONNECT -> {
                 disconnect()
             }
         }
         return START_STICKY
+    }
+
+    private fun startConnection(intent: Intent) {
+        val serverAddr = intent.getStringExtra(EXTRA_SERVER_ADDR) ?: ""
+        val serverIp = intent.getStringExtra(EXTRA_SERVER_IP) ?: ""
+        val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
+        val enableEch = intent.getBooleanExtra(EXTRA_ENABLE_ECH, true)
+        val enableYamux = intent.getBooleanExtra(EXTRA_ENABLE_YAMUX, true)
+        val echDomain = intent.getStringExtra(EXTRA_ECH_DOMAIN) ?: ""
+        val echDohServer = intent.getStringExtra(EXTRA_ECH_DOH_SERVER) ?: ""
+
+        connect(serverAddr, serverIp, token, enableEch, enableYamux, echDomain, echDohServer)
     }
 
     private fun connect(
@@ -121,13 +139,28 @@ class EchVpnService : VpnService(), core.SocketProtector {
                 )
                 Log.i(TAG, "SOCKS5 代理已启动: $localProxyAddr")
 
-                // 3. 启动 TUN2SOCKS
+                // 3. 启动 TUN2SOCKS (在独立协程中运行，不阻塞)
                 Log.i(TAG, "[3/3] 启动 TUN2SOCKS")
-                startTun2Socks()
-                Log.i(TAG, "TUN2SOCKS 已启动")
-
-                updateNotification("已连接")
-                Log.i(TAG, "连接成功")
+                launch {
+                    startTun2Socks()
+                }
+                
+                // 等待 TUN 启动
+                delay(500)
+                
+                if (Core.isTunRunning()) {
+                    Log.i(TAG, "TUN2SOCKS 已启动")
+                    updateNotification("已连接")
+                    Log.i(TAG, "连接成功")
+                    
+                    // 广播连接成功和代理地址
+                    sendBroadcast(Intent(ACTION_STATE_CHANGED).apply {
+                        putExtra(EXTRA_STATE, "connected")
+                        putExtra(EXTRA_PROXY_ADDR, localProxyAddr)
+                    })
+                } else {
+                    throw Exception("TUN2SOCKS 启动失败")
+                }
 
             } catch (e: Exception) {
                 Log.e(TAG, "连接失败", e)
@@ -234,28 +267,45 @@ class EchVpnService : VpnService(), core.SocketProtector {
     private fun disconnect() {
         Log.i(TAG, "正在断开连接")
 
+        // 取消连接协程
         proxyJob?.cancel()
         proxyJob = null
 
         // 停止 TUN 引擎
         try {
-            Core.stopTun()
-            Log.i(TAG, "TUN 已停止")
+            if (Core.isTunRunning()) {
+                Core.stopTun()
+                Log.i(TAG, "TUN 已停止")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "停止 TUN 失败", e)
         }
 
         // 停止 SOCKS5 代理服务器
         try {
-            Core.stopProxy()
-            Log.i(TAG, "SOCKS5 代理已停止")
+            if (Core.isProxyRunning()) {
+                Core.stopProxy()
+                Log.i(TAG, "SOCKS5 代理已停止")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "停止代理失败", e)
         }
 
-        vpnInterface?.close()
-        vpnInterface = null
+        // 关闭 VPN 接口
+        try {
+            vpnInterface?.close()
+            vpnInterface = null
+            Log.i(TAG, "VPN 接口已关闭")
+        } catch (e: Exception) {
+            Log.w(TAG, "关闭 VPN 接口失败", e)
+        }
+
         localProxyAddr = null
+
+        // 广播断开连接
+        sendBroadcast(Intent(ACTION_STATE_CHANGED).apply {
+            putExtra(EXTRA_STATE, "disconnected")
+        })
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
