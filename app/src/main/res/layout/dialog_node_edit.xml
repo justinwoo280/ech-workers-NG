@@ -96,13 +96,14 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:hint="DNS 服务器">
+            android:hint="ECH DOH 服务器">
 
             <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/etDnsServer"
+                android:id="@+id/etEchDohServer"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="1.1.1.1:53" />
+                android:text="https://dns.alidns.com/dns-query"
+                android:inputType="textUri" />
 
         </com.google.android.material.textfield.TextInputLayout>
 

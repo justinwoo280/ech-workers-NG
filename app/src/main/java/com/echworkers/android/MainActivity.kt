@@ -178,6 +178,9 @@ class MainActivity : AppCompatActivity() {
             putExtra(EchVpnService.EXTRA_TOKEN, node.token)
             putExtra(EchVpnService.EXTRA_ENABLE_ECH, node.enableEch)
             putExtra(EchVpnService.EXTRA_ENABLE_YAMUX, node.enableYamux)
+            // ECH 连接配置 (节点级别)
+            putExtra(EchVpnService.EXTRA_ECH_DOMAIN, node.echDomain)
+            putExtra(EchVpnService.EXTRA_ECH_DOH_SERVER, node.echDohServer)
         }
         startService(intent)
         viewModel.setConnected(true)

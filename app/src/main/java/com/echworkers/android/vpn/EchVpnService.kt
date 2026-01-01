@@ -28,6 +28,8 @@ class EchVpnService : VpnService() {
         const val EXTRA_TOKEN = "token"
         const val EXTRA_ENABLE_ECH = "enable_ech"
         const val EXTRA_ENABLE_YAMUX = "enable_yamux"
+        const val EXTRA_ECH_DOMAIN = "ech_domain"
+        const val EXTRA_ECH_DOH_SERVER = "ech_doh_server"
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "ech_vpn_channel"
@@ -58,8 +60,10 @@ class EchVpnService : VpnService() {
                 val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
                 val enableEch = intent.getBooleanExtra(EXTRA_ENABLE_ECH, true)
                 val enableYamux = intent.getBooleanExtra(EXTRA_ENABLE_YAMUX, true)
+                val echDomain = intent.getStringExtra(EXTRA_ECH_DOMAIN) ?: ""
+                val echDohServer = intent.getStringExtra(EXTRA_ECH_DOH_SERVER) ?: ""
 
-                connect(serverAddr, serverIp, token, enableEch, enableYamux)
+                connect(serverAddr, serverIp, token, enableEch, enableYamux, echDomain, echDohServer)
             }
             ACTION_DISCONNECT -> {
                 disconnect()
@@ -73,9 +77,11 @@ class EchVpnService : VpnService() {
         serverIp: String,
         token: String,
         enableEch: Boolean,
-        enableYamux: Boolean
+        enableYamux: Boolean,
+        echDomain: String,
+        echDohServer: String
     ) {
-        Log.i(TAG, "正在连接: $serverAddr")
+        Log.i(TAG, "正在连接: $serverAddr (ECH: $enableEch, Domain: $echDomain, DOH: $echDohServer)")
 
         startForeground(NOTIFICATION_ID, createNotification("正在连接..."))
 
@@ -89,7 +95,9 @@ class EchVpnService : VpnService() {
                     token,
                     localAddr,
                     enableEch,
-                    enableYamux
+                    enableYamux,
+                    echDomain,      // ECH 查询域名
+                    echDohServer    // ECH 用的 DOH 服务器
                 )
 
                 Log.i(TAG, "本地代理已启动: $localProxyAddr")
@@ -114,13 +122,17 @@ class EchVpnService : VpnService() {
     }
 
     private fun establishVpn() {
+        // 加载 DNS 配置
+        val configService = com.echworkers.android.service.ConfigService(this)
+        val config = configService.load()
+        val fallbackDns = config.dnsConfig.fallbackDns.ifEmpty { "1.1.1.1" }
+
         val builder = Builder()
             .setSession("ECH Workers VPN")
             .setMtu(VPN_MTU)
             .addAddress(PRIVATE_VLAN4_CLIENT, 30)
             .addRoute("0.0.0.0", 0)
-            .addDnsServer("8.8.8.8")
-            .addDnsServer("8.8.4.4")
+            .addDnsServer(fallbackDns)  // 使用配置的 DNS
 
         // IPv6 支持
         try {
@@ -187,8 +199,8 @@ class EchVpnService : VpnService() {
 
         withContext(Dispatchers.IO) {
             try {
-                // 使用 Go 核心库的 TUN 处理
-                Core.startTun(fd.toLong(), proxyAddr, VPN_MTU.toLong())
+                // 使用 Go 核心库的 TUN 处理 (参数类型必须匹配 Go 的 int)
+                Core.startTun(fd, proxyAddr, VPN_MTU)
                 Log.i(TAG, "TUN2SOCKS 已启动，代理地址: $proxyAddr")
 
                 // 保持运行直到停止

@@ -22,7 +22,7 @@ class NodeEditDialog(
             binding.switchEch.isChecked = it.enableEch
             binding.switchYamux.isChecked = it.enableYamux
             binding.etEchDomain.setText(it.echDomain)
-            binding.etDnsServer.setText(it.dnsServer)
+            binding.etEchDohServer.setText(it.echDohServer)
         }
     }
 
@@ -42,7 +42,7 @@ class NodeEditDialog(
                     enableEch = binding.switchEch.isChecked,
                     enableYamux = binding.switchYamux.isChecked,
                     echDomain = binding.etEchDomain.text.toString().ifEmpty { "cloudflare-ech.com" },
-                    dnsServer = binding.etDnsServer.text.toString().ifEmpty { "1.1.1.1:53" }
+                    echDohServer = binding.etEchDohServer.text.toString().ifEmpty { "https://dns.alidns.com/dns-query" }
                 )
                 onSave(editedNode)
             }

@@ -1065,7 +1065,15 @@ func Version() string {
 }
 
 // StartProxy 启动代理（简化接口）
-func StartProxy(serverAddr, serverIP, token, localAddr string, enableECH, enableYamux bool) (string, error) {
+// echDomain: ECH 查询域名（如 "cloudflare-ech.com"）
+// echDohServer: ECH 用的 DOH 服务器地址（如 "https://dns.alidns.com/dns-query"）
+func StartProxy(serverAddr, serverIP, token, localAddr string, enableECH, enableYamux bool, echDomain, echDohServer string) (string, error) {
+	if echDomain == "" {
+		echDomain = "cloudflare-ech.com"
+	}
+	if echDohServer == "" {
+		echDohServer = "https://dns.alidns.com/dns-query"
+	}
 	cfg := &Config{
 		ServerAddr:  serverAddr,
 		ServerIP:    serverIP,
@@ -1073,8 +1081,8 @@ func StartProxy(serverAddr, serverIP, token, localAddr string, enableECH, enable
 		LocalAddr:   localAddr,
 		EnableECH:   enableECH,
 		EnableYamux: enableYamux,
-		ECHDomain:   "cloudflare-ech.com",
-		DNSServer:   "dns.alidns.com/dns-query",
+		ECHDomain:   echDomain,
+		DNSServer:   echDohServer,
 	}
 
 	client, err := Start(cfg)
