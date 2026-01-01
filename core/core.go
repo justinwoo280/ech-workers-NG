@@ -62,6 +62,34 @@ func protectSocket(fd int) bool {
 	return socketProtector.Protect(fd)
 }
 
+// createProtectedHTTPClient 创建带 socket 保护的 HTTP client
+func createProtectedHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			// 保护 socket
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				rawConn, err := tcpConn.SyscallConn()
+				if err == nil {
+					rawConn.Control(func(fd uintptr) {
+						protectSocket(int(fd))
+					})
+				}
+			}
+			return conn, nil
+		},
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+	}
+}
+
 func logInfo(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Println(msg)
@@ -676,7 +704,8 @@ func queryDoH(domain, dohURL string) (string, error) {
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("Content-Type", "application/dns-message")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	// 使用带 socket 保护的 HTTP client（VPN 模式必须）
+	client := createProtectedHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("DoH 请求失败: %v", err)
@@ -959,14 +988,19 @@ func (t *WebSocketTransport) dialWebSocket() (*websocket.Conn, error) {
 			return nil, err
 		}
 		
-		// 保护 socket，防止 VPN 流量循环
+		// 保护 socket，防止 VPN 流量循环（必须用 SyscallConn 获取原始 fd）
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			if file, err := tcpConn.File(); err == nil {
-				fd := int(file.Fd())
-				if !protectSocket(fd) {
-					logError("警告: 无法保护 socket fd=%d", fd)
-				}
-				file.Close() // File() 会复制 fd，需要关闭
+			rawConn, err := tcpConn.SyscallConn()
+			if err == nil {
+				rawConn.Control(func(fd uintptr) {
+					if !protectSocket(int(fd)) {
+						logError("警告: 无法保护 socket fd=%d", fd)
+					} else {
+						logInfo("Socket fd=%d 已保护", fd)
+					}
+				})
+			} else {
+				logError("获取 SyscallConn 失败: %v", err)
 			}
 		}
 		
