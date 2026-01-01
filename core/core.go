@@ -150,6 +150,12 @@ var (
 	lowMemoryMode     bool
 )
 
+// 全局客户端管理
+var (
+	globalClient   *Client
+	globalClientMu sync.Mutex
+)
+
 // GetActiveConnections 获取当前活跃连接数
 func GetActiveConnections() int {
 	connectionsMu.Lock()
@@ -1227,6 +1233,16 @@ func Version() string {
 // echDomain: ECH 查询域名（如 "cloudflare-ech.com"）
 // echDohServer: ECH 用的 DOH 服务器地址（如 "dns.alidns.com/dns-query"，无需 https://）
 func StartProxy(serverAddr, serverIP, token, localAddr string, enableECH, enableYamux bool, echDomain, echDohServer string) (string, error) {
+	globalClientMu.Lock()
+	defer globalClientMu.Unlock()
+
+	// 停止旧客户端
+	if globalClient != nil {
+		logInfo("[代理] 停止旧客户端")
+		globalClient.Stop()
+		globalClient = nil
+	}
+
 	if echDomain == "" {
 		echDomain = "cloudflare-ech.com"
 	}
@@ -1253,7 +1269,28 @@ func StartProxy(serverAddr, serverIP, token, localAddr string, enableECH, enable
 		return "", err
 	}
 
+	globalClient = client
+	logInfo("[代理] 全局客户端已启动: %s", client.GetLocalAddr())
 	return client.GetLocalAddr(), nil
+}
+
+// StopProxy 停止代理
+func StopProxy() {
+	globalClientMu.Lock()
+	defer globalClientMu.Unlock()
+
+	if globalClient != nil {
+		globalClient.Stop()
+		globalClient = nil
+		logInfo("[代理] 全局客户端已停止")
+	}
+}
+
+// IsProxyRunning 检查代理运行状态
+func IsProxyRunning() bool {
+	globalClientMu.Lock()
+	defer globalClientMu.Unlock()
+	return globalClient != nil && globalClient.IsRunning()
 }
 
 // EncodeBase64 Base64 编码（工具函数）

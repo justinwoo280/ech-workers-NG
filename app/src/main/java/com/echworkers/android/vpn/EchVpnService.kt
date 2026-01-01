@@ -43,7 +43,8 @@ class EchVpnService : VpnService(), core.SocketProtector {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var proxyJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val serviceJob = SupervisorJob()
+    private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
 
     private var localProxyAddr: String? = null
 
@@ -98,31 +99,38 @@ class EchVpnService : VpnService(), core.SocketProtector {
         Log.i(TAG, "正在连接: $serverAddr (ECH: $enableEch, Domain: $echDomain, DOH: $echDohServer)")
 
         startForeground(NOTIFICATION_ID, createNotification("正在连接..."))
-
-        // ===== DEBUG: 逐步启用功能定位闪退 =====
-        Log.i(TAG, "DEBUG STEP 1: 前台服务已启动")
         
         proxyJob = scope.launch {
             try {
-                Log.i(TAG, "DEBUG STEP 2: 协程已启动")
-                
-                // 测试 1: 只建立 VPN，不启动代理
-                withContext(Dispatchers.Main) {
-                    Log.i(TAG, "DEBUG STEP 3: 准备建立 VPN")
-                    establishVpn()
-                    Log.i(TAG, "DEBUG STEP 4: VPN 已建立")
-                }
+                // 1. 建立 VPN 接口
+                Log.i(TAG, "[1/3] 建立 VPN 接口")
+                establishVpn()
+                Log.i(TAG, "VPN 接口已建立")
 
-                updateNotification("已连接（调试模式）")
-                Log.i(TAG, "DEBUG STEP 5: 完成")
-                
-                // 保持服务运行
-                while (isActive) {
-                    delay(1000)
-                }
+                // 2. 启动 SOCKS5 代理服务器
+                Log.i(TAG, "[2/3] 启动 SOCKS5 代理")
+                localProxyAddr = Core.startProxy(
+                    serverAddr,
+                    serverIp,
+                    token,
+                    "127.0.0.1:0",  // 使用 0 让系统分配端口
+                    enableEch,
+                    enableYamux,
+                    echDomain,
+                    echDohServer
+                )
+                Log.i(TAG, "SOCKS5 代理已启动: $localProxyAddr")
+
+                // 3. 启动 TUN2SOCKS
+                Log.i(TAG, "[3/3] 启动 TUN2SOCKS")
+                startTun2Socks()
+                Log.i(TAG, "TUN2SOCKS 已启动")
+
+                updateNotification("已连接")
+                Log.i(TAG, "连接成功")
 
             } catch (e: Exception) {
-                Log.e(TAG, "DEBUG: 连接失败", e)
+                Log.e(TAG, "连接失败", e)
                 e.printStackTrace()
                 updateNotification("连接失败: ${e.message}")
                 disconnect()
@@ -232,12 +240,22 @@ class EchVpnService : VpnService(), core.SocketProtector {
         // 停止 TUN 引擎
         try {
             Core.stopTun()
+            Log.i(TAG, "TUN 已停止")
         } catch (e: Exception) {
             Log.w(TAG, "停止 TUN 失败", e)
         }
 
+        // 停止 SOCKS5 代理服务器
+        try {
+            Core.stopProxy()
+            Log.i(TAG, "SOCKS5 代理已停止")
+        } catch (e: Exception) {
+            Log.w(TAG, "停止代理失败", e)
+        }
+
         vpnInterface?.close()
         vpnInterface = null
+        localProxyAddr = null
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -245,8 +263,8 @@ class EchVpnService : VpnService(), core.SocketProtector {
 
     override fun onDestroy() {
         super.onDestroy()
+        serviceJob.cancel()  // 取消所有子协程
         disconnect()
-        scope.cancel()
     }
 
     // OOM 防护：响应系统内存警告
