@@ -36,6 +36,16 @@ class EchVpnService : VpnService(), core.SocketProtector {
 
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "ech_vpn_channel"
+        
+        // 使用固定端口以便测试
+        private const val FIXED_PROXY_PORT = 10808
+        
+        // 静态变量存储当前代理地址
+        @Volatile
+        private var currentProxyAddr: String? = null
+        
+        // 获取当前代理地址
+        fun getProxyAddress(): String? = currentProxyAddr
 
         private const val VPN_MTU = 1500
         private const val PRIVATE_VLAN4_CLIENT = "10.0.0.2"
@@ -131,12 +141,13 @@ class EchVpnService : VpnService(), core.SocketProtector {
                     serverAddr,
                     serverIp,
                     token,
-                    "127.0.0.1:0",  // 使用 0 让系统分配端口
+                    "127.0.0.1:$FIXED_PROXY_PORT",  // 使用固定端口
                     enableEch,
                     enableYamux,
                     echDomain,
                     echDohServer
                 )
+                currentProxyAddr = localProxyAddr  // 保存到静态变量
                 Log.i(TAG, "SOCKS5 代理已启动: $localProxyAddr")
 
                 // 3. 启动 TUN2SOCKS (在独立协程中运行，不阻塞)
@@ -146,12 +157,12 @@ class EchVpnService : VpnService(), core.SocketProtector {
                 }
                 
                 // 等待 TUN 启动
-                delay(500)
+                delay(1000)  // 增加等待时间确保 TUN 完全启动
                 
                 if (Core.isTunRunning()) {
                     Log.i(TAG, "TUN2SOCKS 已启动")
                     updateNotification("已连接")
-                    Log.i(TAG, "连接成功")
+                    Log.i(TAG, "连接成功，代理地址: $localProxyAddr")
                     
                     // 广播连接成功和代理地址
                     sendBroadcast(Intent(ACTION_STATE_CHANGED).apply {
@@ -244,14 +255,31 @@ class EchVpnService : VpnService(), core.SocketProtector {
     }
 
     private suspend fun startTun2Socks() {
-        val fd = vpnInterface?.fd ?: return
-        val proxyAddr = localProxyAddr ?: return
+        val fd = vpnInterface?.fd ?: run {
+            Log.e(TAG, "VPN 接口 fd 为空")
+            return
+        }
+        val proxyAddr = localProxyAddr ?: run {
+            Log.e(TAG, "代理地址为空")
+            return
+        }
 
         withContext(Dispatchers.IO) {
             try {
+                Log.i(TAG, "启动 TUN2SOCKS: fd=$fd, proxy=$proxyAddr, mtu=$VPN_MTU")
+                
                 // 使用 Go 核心库的 TUN 处理 (gomobile 将 Go int 映射为 Java long)
                 Core.startTun(fd.toLong(), proxyAddr, VPN_MTU.toLong())
+                
                 Log.i(TAG, "TUN2SOCKS 已启动，代理地址: $proxyAddr")
+                
+                // 验证 TUN 是否真的在运行
+                delay(500)
+                if (Core.isTunRunning()) {
+                    Log.i(TAG, "TUN2SOCKS 运行状态确认: 正在运行")
+                } else {
+                    Log.e(TAG, "TUN2SOCKS 运行状态确认: 未运行")
+                }
 
                 // 保持运行直到停止
                 while (isActive && vpnInterface != null && Core.isTunRunning()) {
@@ -301,6 +329,7 @@ class EchVpnService : VpnService(), core.SocketProtector {
         }
 
         localProxyAddr = null
+        currentProxyAddr = null  // 清除静态变量
 
         // 广播断开连接
         sendBroadcast(Intent(ACTION_STATE_CHANGED).apply {

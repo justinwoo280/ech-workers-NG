@@ -33,10 +33,20 @@ class MainActivity : AppCompatActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.getStringExtra(EchVpnService.EXTRA_STATE)) {
                 "connected" -> {
+                    // 从广播获取地址
                     localProxyAddr = intent.getStringExtra(EchVpnService.EXTRA_PROXY_ADDR)
-                    localProxyAddr?.let { addr ->
-                        viewModel.testConnection(addr)
+                    
+                    // 如果广播中没有，从静态方法获取
+                    if (localProxyAddr.isNullOrEmpty()) {
+                        localProxyAddr = EchVpnService.getProxyAddress()
                     }
+                    
+                    // 延迟测试，确保 TUN 完全就绪
+                    binding.root.postDelayed({
+                        localProxyAddr?.let { addr ->
+                            viewModel.testConnection(addr)
+                        }
+                    }, 2000)
                 }
                 "disconnected" -> {
                     localProxyAddr = null
@@ -214,6 +224,13 @@ class MainActivity : AppCompatActivity() {
         viewModel.setConnected(true)
         
         // 代理地址将通过广播接收，然后自动测试
+        // 备用方案：3秒后如果还没收到广播，使用固定地址测试
+        binding.root.postDelayed({
+            if (localProxyAddr.isNullOrEmpty()) {
+                localProxyAddr = "127.0.0.1:10808"
+                viewModel.testConnection(localProxyAddr!!)
+            }
+        }, 3000)
     }
 
     private fun stopVpn() {
