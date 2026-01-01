@@ -77,6 +77,80 @@ type Config struct {
 
 // ======================== 核心客户端 ========================
 
+// ======================== OOM 防护配置 ========================
+
+const (
+	// 最大并发连接数
+	MaxConnections = 256
+	// 单连接最大缓冲区 (64KB)
+	MaxBufferSize = 64 * 1024
+	// 内存警告阈值 (100MB)
+	MemoryWarningThreshold = 100 * 1024 * 1024
+	// 内存临界阈值 (200MB)
+	MemoryCriticalThreshold = 200 * 1024 * 1024
+)
+
+// 连接计数器
+var (
+	activeConnections int32
+	connectionsMu     sync.Mutex
+	lowMemoryMode     bool
+)
+
+// GetActiveConnections 获取当前活跃连接数
+func GetActiveConnections() int {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	return int(activeConnections)
+}
+
+// SetLowMemoryMode 设置低内存模式（由 Android 端调用）
+func SetLowMemoryMode(enabled bool) {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	lowMemoryMode = enabled
+	if enabled {
+		logInfo("已启用低内存模式，将限制新连接")
+	}
+}
+
+// IsLowMemoryMode 检查是否处于低内存模式
+func IsLowMemoryMode() bool {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	return lowMemoryMode
+}
+
+// acquireConnection 获取连接许可
+func acquireConnection() bool {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	
+	// 低内存模式下，限制为一半连接数
+	maxConn := int32(MaxConnections)
+	if lowMemoryMode {
+		maxConn = MaxConnections / 2
+	}
+	
+	if activeConnections >= maxConn {
+		logError("连接数已达上限: %d/%d", activeConnections, maxConn)
+		return false
+	}
+	activeConnections++
+	return true
+}
+
+// releaseConnection 释放连接许可
+func releaseConnection() {
+	connectionsMu.Lock()
+	defer connectionsMu.Unlock()
+	if activeConnections > 0 {
+		activeConnections--
+	}
+}
+
+// ======================== 核心客户端 ========================
+
 // Client 核心客户端
 type Client struct {
 	config    *Config
@@ -362,6 +436,12 @@ func (c *Client) acceptLoop() {
 }
 
 func (c *Client) handleConnection(conn net.Conn) {
+	// OOM 防护：检查连接数限制
+	if !acquireConnection() {
+		conn.Close()
+		return
+	}
+	defer releaseConnection()
 	defer conn.Close()
 
 	// 解析 SOCKS5 请求

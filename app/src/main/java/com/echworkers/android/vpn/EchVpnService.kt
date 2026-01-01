@@ -240,6 +240,32 @@ class EchVpnService : VpnService() {
         scope.cancel()
     }
 
+    // OOM 防护：响应系统内存警告
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        when (level) {
+            TRIM_MEMORY_RUNNING_LOW,
+            TRIM_MEMORY_RUNNING_CRITICAL -> {
+                Log.w(TAG, "系统内存不足，启用低内存模式 (level=$level)")
+                Core.setLowMemoryMode(true)
+            }
+            TRIM_MEMORY_UI_HIDDEN -> {
+                Log.i(TAG, "应用进入后台，优化内存使用")
+            }
+            TRIM_MEMORY_MODERATE,
+            TRIM_MEMORY_COMPLETE -> {
+                Log.w(TAG, "严重内存不足，限制连接 (level=$level)")
+                Core.setLowMemoryMode(true)
+            }
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        Log.e(TAG, "系统内存严重不足！启用紧急低内存模式")
+        Core.setLowMemoryMode(true)
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
