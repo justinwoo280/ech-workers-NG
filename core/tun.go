@@ -211,12 +211,14 @@ func (t *TunEngine) handleTCP() {
 
 	fwd := tcp.NewForwarder(t.stack, 0, 65535, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
-		dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+		// 修复：使用 RemoteAddress (真实目标) 而不是 LocalAddress (VPN 内部地址)
+		dstAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
 
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
 			r.Complete(true)
+			logError("[TCP] CreateEndpoint 失败: %v", err)
 			return
 		}
 		r.Complete(false)
@@ -227,21 +229,28 @@ func (t *TunEngine) handleTCP() {
 
 	// 将 forwarder 注册到协议栈，处理所有 TCP 包
 	t.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+	logInfo("[TUN] TCP 转发器已注册")
 }
 
 // forwardTCP 通过 SOCKS5 转发 TCP
 func (t *TunEngine) forwardTCP(local net.Conn, dstAddr string) {
 	defer local.Close()
 
+	logInfo("[TCP] 转发连接: %s", dstAddr)
+
 	proxy, err := net.DialTimeout("tcp", t.proxyAddr, 10*time.Second)
 	if err != nil {
+		logError("[TCP] 连接代理失败 %s: %v", dstAddr, err)
 		return
 	}
 	defer proxy.Close()
 
 	if err := socks5Handshake(proxy, dstAddr); err != nil {
+		logError("[TCP] SOCKS5 握手失败 %s: %v", dstAddr, err)
 		return
 	}
+
+	logInfo("[TCP] 已建立连接: %s", dstAddr)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -318,11 +327,13 @@ func (t *TunEngine) handleUDP() {
 
 	fwd := udp.NewForwarder(t.stack, func(r *udp.ForwarderRequest) {
 		id := r.ID()
-		dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+		// 修复：使用 RemoteAddress (真实目标) 而不是 LocalAddress (VPN 内部地址)
+		dstAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
 
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
+			logError("[UDP] CreateEndpoint 失败: %v", err)
 			return
 		}
 
@@ -332,6 +343,7 @@ func (t *TunEngine) handleUDP() {
 
 	// 将 forwarder 注册到协议栈，处理所有 UDP 包
 	t.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+	logInfo("[TUN] UDP 转发器已注册")
 }
 
 // forwardUDP 通过 SOCKS5 UDP ASSOCIATE 转发 UDP
@@ -346,29 +358,43 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	}
 	defer proxy.Close()
 
-	// SOCKS5 UDP ASSOCIATE 握手
-	if err := socks5UDPAssociate(proxy); err != nil {
+	// SOCKS5 UDP ASSOCIATE 握手，获取 UDP 中继地址
+	udpRelayAddr, err := socks5UDPAssociate(proxy)
+	if err != nil {
 		logError("[UDP] SOCKS5 UDP ASSOCIATE 失败: %v", err)
 		return
 	}
 
+	// 如果返回 0.0.0.0，使用代理服务器地址
+	if udpRelayAddr == "0.0.0.0:0" || udpRelayAddr == "" {
+		udpRelayAddr = t.proxyAddr
+	}
+
+	logInfo("[UDP] UDP 中继地址: %s, 目标: %s", udpRelayAddr, dstAddr)
+
 	// 创建 UDP socket 用于实际数据传输
-	udpAddr, err := net.ResolveUDPAddr("udp", t.proxyAddr)
+	udpAddr, err := net.ResolveUDPAddr("udp", udpRelayAddr)
 	if err != nil {
+		logError("[UDP] 解析 UDP 地址失败: %v", err)
 		return
 	}
 
 	udpConn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
+		logError("[UDP] 创建 UDP 连接失败: %v", err)
 		return
 	}
 	defer udpConn.Close()
 
+	// 设置超时
+	udpConn.SetDeadline(time.Now().Add(30 * time.Second))
+
 	// 双向转发
 	done := make(chan struct{}, 2)
 
-	// local -> proxy
+	// local -> proxy (客户端发送数据，如 DNS 查询)
 	go func() {
+		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 2048)
 		for {
 			n, _, err := local.ReadFrom(buf)
@@ -378,13 +404,19 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 
 			// 封装 SOCKS5 UDP 包
 			packet := buildSocks5UDPPacket(dstAddr, buf[:n])
-			udpConn.Write(packet)
+			if _, err := udpConn.Write(packet); err != nil {
+				logError("[UDP] 发送到代理失败: %v", err)
+				break
+			}
+
+			// 重置超时
+			udpConn.SetDeadline(time.Now().Add(30 * time.Second))
 		}
-		done <- struct{}{}
 	}()
 
-	// proxy -> local
+	// proxy -> local (服务器响应数据，如 DNS 响应)
 	go func() {
+		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 2048)
 		for {
 			n, err := udpConn.Read(buf)
@@ -394,56 +426,80 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 
 			// 解析 SOCKS5 UDP 包
 			data := parseSocks5UDPPacket(buf[:n])
-			if data != nil {
-				local.Write(data)
+			if data != nil && len(data) > 0 {
+				// 写回客户端
+				if _, err := local.Write(data); err != nil {
+					logError("[UDP] 写回客户端失败: %v", err)
+					break
+				}
 			}
+
+			// 重置超时
+			udpConn.SetDeadline(time.Now().Add(30 * time.Second))
 		}
-		done <- struct{}{}
 	}()
 
-	// 等待任一方向结束
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-	}
+	// 等待任一方向结束或超时
+	<-done
 }
 
-// socks5UDPAssociate SOCKS5 UDP ASSOCIATE 握手
-func socks5UDPAssociate(conn net.Conn) error {
+// socks5UDPAssociate SOCKS5 UDP ASSOCIATE 握手，返回 UDP 中继地址
+func socks5UDPAssociate(conn net.Conn) (string, error) {
 	// 认证
 	conn.Write([]byte{0x05, 0x01, 0x00})
-	buf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return err
+	buf := make([]byte, 256)
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return "", err
 	}
 	if buf[0] != 0x05 || buf[1] != 0x00 {
-		return errors.New("socks5 auth failed")
+		return "", errors.New("socks5 auth failed")
 	}
 
 	// UDP ASSOCIATE 请求
 	req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	conn.Write(req)
 
-	resp := make([]byte, 10)
-	if _, err := io.ReadFull(conn, resp[:4]); err != nil {
-		return err
+	// 读取响应头
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		return "", err
 	}
-	if resp[1] != 0x00 {
-		return fmt.Errorf("socks5 udp associate failed: %d", resp[1])
-	}
-
-	// 跳过绑定地址
-	switch resp[3] {
-	case 0x01:
-		io.ReadFull(conn, resp[:6])
-	case 0x03:
-		io.ReadFull(conn, resp[:1])
-		io.ReadFull(conn, make([]byte, int(resp[0])+2))
-	case 0x04:
-		io.ReadFull(conn, resp[:18])
+	if buf[1] != 0x00 {
+		return "", fmt.Errorf("socks5 udp associate failed: %d", buf[1])
 	}
 
-	return nil
+	// 解析绑定地址 (UDP 中继地址)
+	atyp := buf[3]
+	var host string
+	var port int
+
+	switch atyp {
+	case 0x01: // IPv4
+		if _, err := io.ReadFull(conn, buf[:6]); err != nil {
+			return "", err
+		}
+		host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
+		port = int(buf[4])<<8 | int(buf[5])
+	case 0x03: // Domain
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			return "", err
+		}
+		length := int(buf[0])
+		if _, err := io.ReadFull(conn, buf[:length+2]); err != nil {
+			return "", err
+		}
+		host = string(buf[:length])
+		port = int(buf[length])<<8 | int(buf[length+1])
+	case 0x04: // IPv6
+		if _, err := io.ReadFull(conn, buf[:18]); err != nil {
+			return "", err
+		}
+		host = net.IP(buf[:16]).String()
+		port = int(buf[16])<<8 | int(buf[17])
+	default:
+		return "", fmt.Errorf("unknown address type: %d", atyp)
+	}
+
+	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
 // buildSocks5UDPPacket 构建 SOCKS5 UDP 数据包
