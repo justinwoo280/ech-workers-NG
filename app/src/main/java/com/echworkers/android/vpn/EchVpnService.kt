@@ -161,7 +161,8 @@ class EchVpnService : VpnService(), core.SocketProtector {
                 
                 if (Core.isTunRunning()) {
                     Log.i(TAG, "TUN2SOCKS 已启动")
-                    updateNotification("已连接")
+                    val statusMsg = "已连接 - $localProxyAddr"
+                    updateNotification(statusMsg)
                     Log.i(TAG, "连接成功，代理地址: $localProxyAddr")
                     
                     // 广播连接成功和代理地址
@@ -170,7 +171,10 @@ class EchVpnService : VpnService(), core.SocketProtector {
                         putExtra(EXTRA_PROXY_ADDR, localProxyAddr)
                     })
                 } else {
-                    throw Exception("TUN2SOCKS 启动失败")
+                    val errorMsg = "TUN2SOCKS 启动失败"
+                    Log.e(TAG, errorMsg)
+                    updateNotification(errorMsg)
+                    throw Exception(errorMsg)
                 }
 
             } catch (e: Exception) {

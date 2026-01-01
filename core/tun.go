@@ -125,12 +125,13 @@ func StartTun(fd int, proxyAddr string, mtu int) error {
 	tunEngine = engine
 
 	// 启动协程
-	engine.wg.Add(3)
+	engine.wg.Add(4)
 	go engine.readFromTun()
 	go engine.writeToTun()
 	go engine.handleTCP()
+	go engine.handleUDP()
 
-	logInfo("[TUN] gVisor 网络栈已启动")
+	logInfo("[TUN] gVisor 网络栈已启动 (TCP + UDP)")
 	return nil
 }
 
@@ -309,6 +310,197 @@ func socks5Handshake(conn net.Conn, dstAddr string) error {
 	}
 
 	return nil
+}
+
+// handleUDP 处理 UDP 连接 (DNS 等)
+func (t *TunEngine) handleUDP() {
+	defer t.wg.Done()
+
+	fwd := udp.NewForwarder(t.stack, func(r *udp.ForwarderRequest) {
+		id := r.ID()
+		dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			return
+		}
+
+		conn := gonet.NewUDPConn(t.stack, &wq, ep)
+		go t.forwardUDP(conn, dstAddr)
+	})
+
+	// 将 forwarder 注册到协议栈，处理所有 UDP 包
+	t.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+}
+
+// forwardUDP 通过 SOCKS5 UDP ASSOCIATE 转发 UDP
+func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
+	defer local.Close()
+
+	// 连接到 SOCKS5 代理
+	proxy, err := net.DialTimeout("tcp", t.proxyAddr, 5*time.Second)
+	if err != nil {
+		logError("[UDP] 连接代理失败: %v", err)
+		return
+	}
+	defer proxy.Close()
+
+	// SOCKS5 UDP ASSOCIATE 握手
+	if err := socks5UDPAssociate(proxy); err != nil {
+		logError("[UDP] SOCKS5 UDP ASSOCIATE 失败: %v", err)
+		return
+	}
+
+	// 创建 UDP socket 用于实际数据传输
+	udpAddr, err := net.ResolveUDPAddr("udp", t.proxyAddr)
+	if err != nil {
+		return
+	}
+
+	udpConn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return
+	}
+	defer udpConn.Close()
+
+	// 双向转发
+	done := make(chan struct{}, 2)
+
+	// local -> proxy
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, _, err := local.ReadFrom(buf)
+			if err != nil {
+				break
+			}
+
+			// 封装 SOCKS5 UDP 包
+			packet := buildSocks5UDPPacket(dstAddr, buf[:n])
+			udpConn.Write(packet)
+		}
+		done <- struct{}{}
+	}()
+
+	// proxy -> local
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, err := udpConn.Read(buf)
+			if err != nil {
+				break
+			}
+
+			// 解析 SOCKS5 UDP 包
+			data := parseSocks5UDPPacket(buf[:n])
+			if data != nil {
+				local.Write(data)
+			}
+		}
+		done <- struct{}{}
+	}()
+
+	// 等待任一方向结束
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+	}
+}
+
+// socks5UDPAssociate SOCKS5 UDP ASSOCIATE 握手
+func socks5UDPAssociate(conn net.Conn) error {
+	// 认证
+	conn.Write([]byte{0x05, 0x01, 0x00})
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	if buf[0] != 0x05 || buf[1] != 0x00 {
+		return errors.New("socks5 auth failed")
+	}
+
+	// UDP ASSOCIATE 请求
+	req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	conn.Write(req)
+
+	resp := make([]byte, 10)
+	if _, err := io.ReadFull(conn, resp[:4]); err != nil {
+		return err
+	}
+	if resp[1] != 0x00 {
+		return fmt.Errorf("socks5 udp associate failed: %d", resp[1])
+	}
+
+	// 跳过绑定地址
+	switch resp[3] {
+	case 0x01:
+		io.ReadFull(conn, resp[:6])
+	case 0x03:
+		io.ReadFull(conn, resp[:1])
+		io.ReadFull(conn, make([]byte, int(resp[0])+2))
+	case 0x04:
+		io.ReadFull(conn, resp[:18])
+	}
+
+	return nil
+}
+
+// buildSocks5UDPPacket 构建 SOCKS5 UDP 数据包
+func buildSocks5UDPPacket(dstAddr string, data []byte) []byte {
+	host, portStr, _ := net.SplitHostPort(dstAddr)
+	port := 0
+	fmt.Sscanf(portStr, "%d", &port)
+
+	packet := []byte{0x00, 0x00, 0x00} // RSV, FRAG
+
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			packet = append(packet, 0x01)
+			packet = append(packet, ip4...)
+		} else {
+			packet = append(packet, 0x04)
+			packet = append(packet, ip.To16()...)
+		}
+	} else {
+		packet = append(packet, 0x03, byte(len(host)))
+		packet = append(packet, []byte(host)...)
+	}
+
+	packet = append(packet, byte(port>>8), byte(port))
+	packet = append(packet, data...)
+	return packet
+}
+
+// parseSocks5UDPPacket 解析 SOCKS5 UDP 数据包
+func parseSocks5UDPPacket(packet []byte) []byte {
+	if len(packet) < 10 {
+		return nil
+	}
+
+	offset := 3 // 跳过 RSV, FRAG
+	atyp := packet[offset]
+	offset++
+
+	switch atyp {
+	case 0x01: // IPv4
+		offset += 4
+	case 0x03: // Domain
+		length := int(packet[offset])
+		offset += 1 + length
+	case 0x04: // IPv6
+		offset += 16
+	default:
+		return nil
+	}
+
+	offset += 2 // 跳过端口
+
+	if offset >= len(packet) {
+		return nil
+	}
+
+	return packet[offset:]
 }
 
 // StopTun 停止 TUN
