@@ -4,12 +4,27 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <group android:scaleX="2.5"
-        android:scaleY="2.5"
-        android:translateX="27"
-        android:translateY="27">
-        <path
-            android:fillColor="#FFFFFF"
-            android:pathData="M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5l-9,-4zm0,10.99h7c-0.53,4.12 -3.28,7.79 -7,8.94V12H5V6.3l7,-3.11v8.8z" />
-    </group>
+    
+    <!-- Cloudflare Tunnel 风格: 隧道穿越效果 -->
+    
+    <!-- 外层隧道环 - 深橙色 -->
+    <path
+        android:fillColor="#E05A00"
+        android:pathData="M54,24 C70.57,24 84,37.43 84,54 C84,70.57 70.57,84 54,84 C37.43,84 24,70.57 24,54 C24,37.43 37.43,24 54,24 Z M54,32 C41.85,32 32,41.85 32,54 C32,66.15 41.85,76 54,76 C66.15,76 76,66.15 76,54 C76,41.85 66.15,32 54,32 Z"/>
+    
+    <!-- 中层隧道环 - 橙色 -->
+    <path
+        android:fillColor="#F6821F"
+        android:pathData="M54,36 C63.94,36 72,44.06 72,54 C72,63.94 63.94,72 54,72 C44.06,72 36,63.94 36,54 C36,44.06 44.06,36 54,36 Z M54,42 C47.37,42 42,47.37 42,54 C42,60.63 47.37,66 54,66 C60.63,66 66,60.63 66,54 C66,47.37 60.63,42 54,42 Z"/>
+    
+    <!-- 内层核心 - 亮橙/黄色 -->
+    <path
+        android:fillColor="#FFAA33"
+        android:pathData="M54,46 C58.42,46 62,49.58 62,54 C62,58.42 58.42,62 54,62 C49.58,62 46,58.42 46,54 C46,49.58 49.58,46 54,46 Z"/>
+    
+    <!-- 穿越箭头 - 白色 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,54 L54,44 L54,50 L68,50 L68,58 L54,58 L54,64 Z"/>
+    
 </vector>
