@@ -99,38 +99,31 @@ class EchVpnService : VpnService(), core.SocketProtector {
 
         startForeground(NOTIFICATION_ID, createNotification("正在连接..."))
 
+        // ===== DEBUG: 逐步启用功能定位闪退 =====
+        Log.i(TAG, "DEBUG STEP 1: 前台服务已启动")
+        
         proxyJob = scope.launch {
             try {
-                // 启动本地 SOCKS5 代理
-                val localAddr = "127.0.0.1:10808"
-                localProxyAddr = Core.startProxy(
-                    serverAddr,
-                    serverIp,
-                    token,
-                    localAddr,
-                    enableEch,
-                    enableYamux,
-                    echDomain,      // ECH 查询域名
-                    echDohServer    // ECH 用的 DOH 服务器
-                )
-
-                Log.i(TAG, "本地代理已启动: $localProxyAddr")
-
-                // 建立 VPN 接口
+                Log.i(TAG, "DEBUG STEP 2: 协程已启动")
+                
+                // 测试 1: 只建立 VPN，不启动代理
                 withContext(Dispatchers.Main) {
+                    Log.i(TAG, "DEBUG STEP 3: 准备建立 VPN")
                     establishVpn()
+                    Log.i(TAG, "DEBUG STEP 4: VPN 已建立")
                 }
 
-                updateNotification("已连接")
-                Log.i(TAG, "VPN 已连接")
-
-                // 启动 TUN -> SOCKS5 转发
-                // TODO: 调试闪退问题，暂时禁用 TUN
-                Log.i(TAG, "DEBUG: 跳过 TUN 启动，测试代理是否正常")
-                // startTun2Socks()
+                updateNotification("已连接（调试模式）")
+                Log.i(TAG, "DEBUG STEP 5: 完成")
+                
+                // 保持服务运行
+                while (isActive) {
+                    delay(1000)
+                }
 
             } catch (e: Exception) {
-                Log.e(TAG, "连接失败", e)
+                Log.e(TAG, "DEBUG: 连接失败", e)
+                e.printStackTrace()
                 updateNotification("连接失败: ${e.message}")
                 disconnect()
             }
