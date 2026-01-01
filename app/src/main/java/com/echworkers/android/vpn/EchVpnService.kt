@@ -125,7 +125,9 @@ class EchVpnService : VpnService(), core.SocketProtector {
                 Log.i(TAG, "VPN 已连接")
 
                 // 启动 TUN -> SOCKS5 转发
-                startTun2Socks()
+                // TODO: 调试闪退问题，暂时禁用 TUN
+                Log.i(TAG, "DEBUG: 跳过 TUN 启动，测试代理是否正常")
+                // startTun2Socks()
 
             } catch (e: Exception) {
                 Log.e(TAG, "连接失败", e)
