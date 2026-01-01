@@ -199,8 +199,8 @@ class EchVpnService : VpnService() {
 
         withContext(Dispatchers.IO) {
             try {
-                // 使用 Go 核心库的 TUN 处理 (参数类型必须匹配 Go 的 int)
-                Core.startTun(fd, proxyAddr, VPN_MTU)
+                // 使用 Go 核心库的 TUN 处理 (gomobile 将 Go int 映射为 Java long)
+                Core.startTun(fd.toLong(), proxyAddr, VPN_MTU.toLong())
                 Log.i(TAG, "TUN2SOCKS 已启动，代理地址: $proxyAddr")
 
                 // 保持运行直到停止
