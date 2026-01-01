@@ -17,7 +17,7 @@ import kotlinx.coroutines.*
 import java.io.FileInputStream
 import java.io.FileOutputStream
 
-class EchVpnService : VpnService() {
+class EchVpnService : VpnService(), core.SocketProtector {
 
     companion object {
         const val TAG = "EchVpnService"
@@ -50,6 +50,20 @@ class EchVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        // 设置 socket 保护器，防止 VPN 流量循环
+        Core.setSocketProtector(this)
+    }
+
+    // 实现 SocketProtector 接口 - 保护 socket 不经过 VPN
+    override fun protect(fd: Long): Boolean {
+        return try {
+            val result = protect(fd.toInt())
+            Log.d(TAG, "保护 socket fd=$fd 结果: $result")
+            result
+        } catch (e: Exception) {
+            Log.e(TAG, "保护 socket 失败: fd=$fd", e)
+            false
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

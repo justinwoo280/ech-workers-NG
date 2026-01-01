@@ -37,6 +37,31 @@ func SetLogger(l Logger) {
 	logger = l
 }
 
+// ======================== Socket 保护（VPN 必须）========================
+
+// SocketProtector Socket 保护接口（防止 VPN 流量循环）
+type SocketProtector interface {
+	// Protect 保护 socket fd，使其流量不经过 VPN
+	Protect(fd int) bool
+}
+
+var socketProtector SocketProtector
+
+// SetSocketProtector 设置 socket 保护器（由 Android VpnService 实现）
+func SetSocketProtector(p SocketProtector) {
+	socketProtector = p
+	logInfo("Socket 保护器已设置")
+}
+
+// protectSocket 保护 socket（内部调用）
+func protectSocket(fd int) bool {
+	if socketProtector == nil {
+		logError("警告: Socket 保护器未设置，VPN 可能无法正常工作")
+		return false
+	}
+	return socketProtector.Protect(fd)
+}
+
 func logInfo(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Println(msg)
@@ -918,14 +943,34 @@ func (t *WebSocketTransport) dialWebSocket() (*websocket.Conn, error) {
 		dialer.Subprotocols = []string{t.token}
 	}
 
-	if t.serverIP != "" {
-		dialer.NetDial = func(network, address string) (net.Conn, error) {
+	// 自定义 Dial 以支持 socket 保护（VPN 必须）
+	dialer.NetDial = func(network, address string) (net.Conn, error) {
+		targetAddr := address
+		if t.serverIP != "" {
 			_, p, err := net.SplitHostPort(address)
 			if err != nil {
 				return nil, err
 			}
-			return net.DialTimeout(network, net.JoinHostPort(t.serverIP, p), 10*time.Second)
+			targetAddr = net.JoinHostPort(t.serverIP, p)
 		}
+		
+		conn, err := net.DialTimeout(network, targetAddr, 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		
+		// 保护 socket，防止 VPN 流量循环
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			if file, err := tcpConn.File(); err == nil {
+				fd := int(file.Fd())
+				if !protectSocket(fd) {
+					logError("警告: 无法保护 socket fd=%d", fd)
+				}
+				file.Close() // File() 会复制 fd，需要关闭
+			}
+		}
+		
+		return conn, nil
 	}
 
 	wsConn, _, err := dialer.Dial(wsURL, nil)
