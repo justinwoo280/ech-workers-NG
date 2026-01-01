@@ -1191,13 +1191,17 @@ func Version() string {
 
 // StartProxy 启动代理（简化接口）
 // echDomain: ECH 查询域名（如 "cloudflare-ech.com"）
-// echDohServer: ECH 用的 DOH 服务器地址（如 "https://dns.alidns.com/dns-query"）
+// echDohServer: ECH 用的 DOH 服务器地址（如 "dns.alidns.com/dns-query"，无需 https://）
 func StartProxy(serverAddr, serverIP, token, localAddr string, enableECH, enableYamux bool, echDomain, echDohServer string) (string, error) {
 	if echDomain == "" {
 		echDomain = "cloudflare-ech.com"
 	}
 	if echDohServer == "" {
-		echDohServer = "https://dns.alidns.com/dns-query"
+		echDohServer = "dns.alidns.com/dns-query"
+	}
+	// 自动补全 https:// 前缀
+	if !strings.HasPrefix(echDohServer, "https://") && !strings.HasPrefix(echDohServer, "http://") {
+		echDohServer = "https://" + echDohServer
 	}
 	cfg := &Config{
 		ServerAddr:  serverAddr,

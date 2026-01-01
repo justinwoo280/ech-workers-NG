@@ -12,11 +12,11 @@ data class NodeConfig(
     var enableYamux: Boolean = true,
     // ECH 连接配置 (仅当 enableEch=true 时生效)
     var echDomain: String = "cloudflare-ech.com",          // ECH 查询域名
-    var echDohServer: String = "https://dns.alidns.com/dns-query"  // ECH 用的 DOH 服务器
+    var echDohServer: String = "dns.alidns.com/dns-query"  // ECH 用的 DOH 服务器 (无需 https://)
 )
 
 data class DnsConfig(
-    var dohServer: String = "https://cloudflare-dns.com/dns-query",  // DOH 服务器
+    var dohServer: String = "cloudflare-dns.com/dns-query",  // DOH 服务器 (无需 https://)
     var dotServer: String = "",                                        // DOT 服务器 (可选)
     var fallbackDns: String = "1.1.1.1"                               // 回退 DNS
 )

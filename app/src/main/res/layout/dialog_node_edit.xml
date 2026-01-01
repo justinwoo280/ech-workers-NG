@@ -102,8 +102,9 @@
                 android:id="@+id/etEchDohServer"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="https://dns.alidns.com/dns-query"
-                android:inputType="textUri" />
+                android:text="dns.alidns.com/dns-query"
+                android:inputType="textUri"
+                android:hint="例: dns.alidns.com/dns-query" />
 
         </com.google.android.material.textfield.TextInputLayout>
 
