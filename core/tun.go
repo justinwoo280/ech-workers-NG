@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/miekg/dns"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -62,10 +63,11 @@ var (
 // ======================== FakeDNS 配置 ========================
 
 const (
-	// FakeDNS IP 范围: 198.18.0.0/16 (Clash 标准)
-	FakeDNSPrefix = "198.18.0.0/16"
+	// FakeDNS IP 范围: 198.18.0.0/15 (RFC 2544, 131072 个 IP)
+	// 从 198.18.0.0 到 198.19.255.255
+	FakeDNSPrefix = "198.18.0.0/15"
 	FakeDNSStart  = 0xC6120001 // 198.18.0.1
-	FakeDNSEnd    = 0xC612FFFF // 198.18.255.255
+	FakeDNSEnd    = 0xC613FFFF // 198.19.255.255 (131071 个可用 IP)
 )
 
 var (
@@ -75,7 +77,7 @@ var (
 	fakeDNSReverse = make(map[string]string)
 	// FakeDNS 互斥锁
 	fakeDNSMu sync.RWMutex
-	// 当前分配的 FakeIP 索引
+	// 当前分配的 FakeIP 索引 (Ring Buffer)
 	fakeDNSIndex uint32 = FakeDNSStart
 )
 
@@ -96,38 +98,52 @@ func GetGlobalTransport() *WebSocketTransport {
 
 // ======================== FakeDNS 函数 ========================
 
-// allocateFakeIP 为域名分配 FakeIP
+// allocateFakeIP 为域名分配 FakeIP (Ring Buffer 实现，防止内存泄漏)
 func allocateFakeIP(domain string) net.IP {
 	fakeDNSMu.Lock()
 	defer fakeDNSMu.Unlock()
 
-	// 检查是否已分配
+	// 1. 检查域名是否已分配
 	if ip, exists := fakeDNSMap[domain]; exists {
 		return ip
 	}
 
-	// 分配新的 FakeIP
-	if fakeDNSIndex > FakeDNSEnd {
-		fakeDNSIndex = FakeDNSStart // 循环使用
+	// 2. 分配新的 FakeIP
+	ip := uint32ToIP(fakeDNSIndex)
+
+	// 3. Ring Buffer: 检查这个 IP 是否已分配给其他域名
+	// 如果是，删除旧映射（LRU 淘汰）
+	if oldDomain, exists := fakeDNSReverse[ip.String()]; exists {
+		delete(fakeDNSMap, oldDomain)
+		logInfo("[FakeDNS] 复用 IP: %s (旧域名: %s)", ip.String(), oldDomain)
 	}
 
-	ip := make(net.IP, 4)
-	ip[0] = byte(fakeDNSIndex >> 24)
-	ip[1] = byte(fakeDNSIndex >> 16)
-	ip[2] = byte(fakeDNSIndex >> 8)
-	ip[3] = byte(fakeDNSIndex)
-
-	fakeDNSIndex++
-
-	// 保存映射
+	// 4. 建立新映射
 	fakeDNSMap[domain] = ip
 	fakeDNSReverse[ip.String()] = domain
+
+	// 5. 移动游标，循环使用
+	fakeDNSIndex++
+	if fakeDNSIndex > FakeDNSEnd {
+		fakeDNSIndex = FakeDNSStart
+		logInfo("[FakeDNS] IP 池已循环一圈，从头开始")
+	}
 
 	logInfo("[FakeDNS] 分配: %s -> %s", domain, ip.String())
 	return ip
 }
 
-// isFakeIP 检查 IP 是否是 FakeIP
+// uint32ToIP 将 uint32 转换为 net.IP
+func uint32ToIP(n uint32) net.IP {
+	ip := make(net.IP, 4)
+	ip[0] = byte(n >> 24)
+	ip[1] = byte(n >> 16)
+	ip[2] = byte(n >> 8)
+	ip[3] = byte(n)
+	return ip
+}
+
+// isFakeIP 检查 IP 是否是 FakeIP (198.18.0.0/15)
 func isFakeIP(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
@@ -138,8 +154,9 @@ func isFakeIP(ipStr string) bool {
 		return false
 	}
 
-	// 检查是否在 198.18.0.0/16 范围内
-	return ip[0] == 198 && ip[1] == 18
+	// 检查是否在 198.18.0.0/15 范围内
+	// 198.18.0.0 - 198.19.255.255
+	return ip[0] == 198 && (ip[1] == 18 || ip[1] == 19)
 }
 
 // resolveFakeDomain 反查 FakeIP 对应的真实域名
@@ -153,92 +170,51 @@ func resolveFakeDomain(ipStr string) string {
 	return ipStr // 如果找不到，返回原 IP
 }
 
-// parseDNSQuery 解析 DNS 查询包，提取域名
-func parseDNSQuery(packet []byte) string {
-	if len(packet) < 12 {
-		return ""
+// parseDNSQuery 使用 miekg/dns 库解析 DNS 查询
+func parseDNSQuery(packet []byte) (string, *dns.Msg) {
+	msg := new(dns.Msg)
+	if err := msg.Unpack(packet); err != nil {
+		return "", nil
 	}
 
-	// DNS 头部: 12 字节
-	// 跳过 Transaction ID (2), Flags (2), Questions (2), Answer RRs (2), Authority RRs (2), Additional RRs (2)
-	offset := 12
-
-	// 解析 Question Section
-	domain := ""
-	for offset < len(packet) {
-		length := int(packet[offset])
-		if length == 0 {
-			break
-		}
-		offset++
-
-		if offset+length > len(packet) {
-			return ""
-		}
-
-		if domain != "" {
-			domain += "."
-		}
-		domain += string(packet[offset : offset+length])
-		offset += length
+	if len(msg.Question) == 0 {
+		return "", nil
 	}
 
-	return domain
+	// 提取域名（去掉末尾的点）
+	domain := msg.Question[0].Name
+	if len(domain) > 0 && domain[len(domain)-1] == '.' {
+		domain = domain[:len(domain)-1]
+	}
+
+	return domain, msg
 }
 
-// buildDNSResponse 构造 DNS 响应包
-func buildDNSResponse(query []byte, ip net.IP) []byte {
-	if len(query) < 12 {
+// buildDNSResponse 使用 miekg/dns 库构造 DNS 响应
+func buildDNSResponse(query *dns.Msg, domain string, ip net.IP) []byte {
+	resp := new(dns.Msg)
+	resp.SetReply(query)
+	resp.Authoritative = true
+
+	// 构造 A 记录
+	rr := &dns.A{
+		Hdr: dns.RR_Header{
+			Name:   query.Question[0].Name,
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    1, // TTL = 1 秒，防止客户端缓存导致 IP 复用冲突
+		},
+		A: ip,
+	}
+	resp.Answer = append(resp.Answer, rr)
+
+	// 序列化
+	out, err := resp.Pack()
+	if err != nil {
 		return nil
 	}
 
-	// 复制查询包作为基础
-	response := make([]byte, len(query)+16) // 预留 16 字节给 Answer
-	copy(response, query)
-
-	// 修改 Flags: QR=1 (Response), AA=1 (Authoritative)
-	response[2] = 0x81
-	response[3] = 0x80
-
-	// Answer RRs = 1
-	response[6] = 0x00
-	response[7] = 0x01
-
-	// 添加 Answer Section
-	offset := len(query)
-
-	// Name: 使用指针指向 Question 中的域名 (0xC00C)
-	response[offset] = 0xC0
-	response[offset+1] = 0x0C
-	offset += 2
-
-	// Type: A (0x0001)
-	response[offset] = 0x00
-	response[offset+1] = 0x01
-	offset += 2
-
-	// Class: IN (0x0001)
-	response[offset] = 0x00
-	response[offset+1] = 0x01
-	offset += 2
-
-	// TTL: 60 秒
-	response[offset] = 0x00
-	response[offset+1] = 0x00
-	response[offset+2] = 0x00
-	response[offset+3] = 0x3C
-	offset += 4
-
-	// Data Length: 4 (IPv4)
-	response[offset] = 0x00
-	response[offset+1] = 0x04
-	offset += 2
-
-	// IP Address
-	copy(response[offset:], ip.To4())
-	offset += 4
-
-	return response[:offset]
+	return out
 }
 
 // StartTun 启动 TUN 设备处理
@@ -578,9 +554,15 @@ func (t *TunEngine) handleDNS(conn *gonet.UDPConn, dnsServer string) {
 	}
 
 	// 解析 DNS 查询
-	domain := parseDNSQuery(buf[:n])
-	if domain == "" {
+	domain, query := parseDNSQuery(buf[:n])
+	if domain == "" || query == nil {
 		logError("[FakeDNS] 解析 DNS 查询失败")
+		return
+	}
+
+	// 只处理 A 记录查询
+	if len(query.Question) == 0 || query.Question[0].Qtype != dns.TypeA {
+		logError("[FakeDNS] 非 A 记录查询，忽略")
 		return
 	}
 
@@ -588,7 +570,7 @@ func (t *TunEngine) handleDNS(conn *gonet.UDPConn, dnsServer string) {
 	fakeIP := allocateFakeIP(domain)
 
 	// 构造 DNS 响应
-	response := buildDNSResponse(buf[:n], fakeIP)
+	response := buildDNSResponse(query, domain, fakeIP)
 	if response == nil {
 		logError("[FakeDNS] 构造 DNS 响应失败")
 		return
