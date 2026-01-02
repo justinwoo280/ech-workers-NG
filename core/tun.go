@@ -59,6 +59,26 @@ var (
 	transportMu     sync.RWMutex
 )
 
+// ======================== FakeDNS 配置 ========================
+
+const (
+	// FakeDNS IP 范围: 198.18.0.0/16 (Clash 标准)
+	FakeDNSPrefix = "198.18.0.0/16"
+	FakeDNSStart  = 0xC6120001 // 198.18.0.1
+	FakeDNSEnd    = 0xC612FFFF // 198.18.255.255
+)
+
+var (
+	// 域名 -> FakeIP 映射
+	fakeDNSMap = make(map[string]net.IP)
+	// FakeIP -> 域名 反向映射
+	fakeDNSReverse = make(map[string]string)
+	// FakeDNS 互斥锁
+	fakeDNSMu sync.RWMutex
+	// 当前分配的 FakeIP 索引
+	fakeDNSIndex uint32 = FakeDNSStart
+)
+
 // SetGlobalTransport 设置全局 transport（由 Client 调用）
 func SetGlobalTransport(t *WebSocketTransport) {
 	transportMu.Lock()
@@ -72,6 +92,153 @@ func GetGlobalTransport() *WebSocketTransport {
 	transportMu.RLock()
 	defer transportMu.RUnlock()
 	return globalTransport
+}
+
+// ======================== FakeDNS 函数 ========================
+
+// allocateFakeIP 为域名分配 FakeIP
+func allocateFakeIP(domain string) net.IP {
+	fakeDNSMu.Lock()
+	defer fakeDNSMu.Unlock()
+
+	// 检查是否已分配
+	if ip, exists := fakeDNSMap[domain]; exists {
+		return ip
+	}
+
+	// 分配新的 FakeIP
+	if fakeDNSIndex > FakeDNSEnd {
+		fakeDNSIndex = FakeDNSStart // 循环使用
+	}
+
+	ip := make(net.IP, 4)
+	ip[0] = byte(fakeDNSIndex >> 24)
+	ip[1] = byte(fakeDNSIndex >> 16)
+	ip[2] = byte(fakeDNSIndex >> 8)
+	ip[3] = byte(fakeDNSIndex)
+
+	fakeDNSIndex++
+
+	// 保存映射
+	fakeDNSMap[domain] = ip
+	fakeDNSReverse[ip.String()] = domain
+
+	logInfo("[FakeDNS] 分配: %s -> %s", domain, ip.String())
+	return ip
+}
+
+// isFakeIP 检查 IP 是否是 FakeIP
+func isFakeIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+
+	// 检查是否在 198.18.0.0/16 范围内
+	return ip[0] == 198 && ip[1] == 18
+}
+
+// resolveFakeDomain 反查 FakeIP 对应的真实域名
+func resolveFakeDomain(ipStr string) string {
+	fakeDNSMu.RLock()
+	defer fakeDNSMu.RUnlock()
+
+	if domain, exists := fakeDNSReverse[ipStr]; exists {
+		return domain
+	}
+	return ipStr // 如果找不到，返回原 IP
+}
+
+// parseDNSQuery 解析 DNS 查询包，提取域名
+func parseDNSQuery(packet []byte) string {
+	if len(packet) < 12 {
+		return ""
+	}
+
+	// DNS 头部: 12 字节
+	// 跳过 Transaction ID (2), Flags (2), Questions (2), Answer RRs (2), Authority RRs (2), Additional RRs (2)
+	offset := 12
+
+	// 解析 Question Section
+	domain := ""
+	for offset < len(packet) {
+		length := int(packet[offset])
+		if length == 0 {
+			break
+		}
+		offset++
+
+		if offset+length > len(packet) {
+			return ""
+		}
+
+		if domain != "" {
+			domain += "."
+		}
+		domain += string(packet[offset : offset+length])
+		offset += length
+	}
+
+	return domain
+}
+
+// buildDNSResponse 构造 DNS 响应包
+func buildDNSResponse(query []byte, ip net.IP) []byte {
+	if len(query) < 12 {
+		return nil
+	}
+
+	// 复制查询包作为基础
+	response := make([]byte, len(query)+16) // 预留 16 字节给 Answer
+	copy(response, query)
+
+	// 修改 Flags: QR=1 (Response), AA=1 (Authoritative)
+	response[2] = 0x81
+	response[3] = 0x80
+
+	// Answer RRs = 1
+	response[6] = 0x00
+	response[7] = 0x01
+
+	// 添加 Answer Section
+	offset := len(query)
+
+	// Name: 使用指针指向 Question 中的域名 (0xC00C)
+	response[offset] = 0xC0
+	response[offset+1] = 0x0C
+	offset += 2
+
+	// Type: A (0x0001)
+	response[offset] = 0x00
+	response[offset+1] = 0x01
+	offset += 2
+
+	// Class: IN (0x0001)
+	response[offset] = 0x00
+	response[offset+1] = 0x01
+	offset += 2
+
+	// TTL: 60 秒
+	response[offset] = 0x00
+	response[offset+1] = 0x00
+	response[offset+2] = 0x00
+	response[offset+3] = 0x3C
+	offset += 4
+
+	// Data Length: 4 (IPv4)
+	response[offset] = 0x00
+	response[offset+1] = 0x04
+	offset += 2
+
+	// IP Address
+	copy(response[offset:], ip.To4())
+	offset += 4
+
+	return response[:offset]
 }
 
 // StartTun 启动 TUN 设备处理
@@ -259,6 +426,16 @@ func (t *TunEngine) handleTCP() {
 func (t *TunEngine) forwardTCP(local net.Conn, dstAddr string) {
 	defer local.Close()
 
+	// FakeDNS 反查：如果目标是 FakeIP，替换为真实域名
+	host, port, _ := net.SplitHostPort(dstAddr)
+	if isFakeIP(host) {
+		domain := resolveFakeDomain(host)
+		if domain != host {
+			dstAddr = fmt.Sprintf("%s:%s", domain, port)
+			logInfo("[FakeDNS] TCP 反查: %s -> %s", host, domain)
+		}
+	}
+
 	logInfo("[TCP] 直接转发: %s", dstAddr)
 
 	// 直接调用 transport.Dial()，不走 SOCKS5
@@ -364,7 +541,6 @@ func (t *TunEngine) handleUDP() {
 
 	fwd := udp.NewForwarder(t.stack, func(r *udp.ForwarderRequest) {
 		id := r.ID()
-		// 修复：使用 RemoteAddress (真实目标) 而不是 LocalAddress (VPN 内部地址)
 		dstAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
 
 		var wq waiter.Queue
@@ -375,17 +551,71 @@ func (t *TunEngine) handleUDP() {
 		}
 
 		conn := gonet.NewUDPConn(t.stack, &wq, ep)
+
+		// 拦截 DNS 请求 (端口 53)
+		if id.RemotePort == 53 {
+			go t.handleDNS(conn, id.RemoteAddress.String())
+			return
+		}
+
+		// 其他 UDP 正常转发
 		go t.forwardUDP(conn, dstAddr)
 	})
 
 	// 将 forwarder 注册到协议栈，处理所有 UDP 包
 	t.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
-	logInfo("[TUN] UDP 转发器已注册")
+	logInfo("[TUN] UDP 转发器已注册 (FakeDNS 已启用)")
+}
+
+// handleDNS 处理 DNS 查询，返回 FakeIP
+func (t *TunEngine) handleDNS(conn *gonet.UDPConn, dnsServer string) {
+	defer conn.Close()
+
+	buf := make([]byte, 512)
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		return
+	}
+
+	// 解析 DNS 查询
+	domain := parseDNSQuery(buf[:n])
+	if domain == "" {
+		logError("[FakeDNS] 解析 DNS 查询失败")
+		return
+	}
+
+	// 分配 FakeIP
+	fakeIP := allocateFakeIP(domain)
+
+	// 构造 DNS 响应
+	response := buildDNSResponse(buf[:n], fakeIP)
+	if response == nil {
+		logError("[FakeDNS] 构造 DNS 响应失败")
+		return
+	}
+
+	// 发送响应
+	if _, err := conn.Write(response); err != nil {
+		logError("[FakeDNS] 发送响应失败: %v", err)
+		return
+	}
+
+	logInfo("[FakeDNS] %s -> %s (DNS: %s)", domain, fakeIP.String(), dnsServer)
 }
 
 // forwardUDP 直接通过 transport 转发 UDP（零拷贝）
 func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	defer local.Close()
+
+	// FakeDNS 反查：如果目标是 FakeIP，替换为真实域名
+	host, port, _ := net.SplitHostPort(dstAddr)
+	if isFakeIP(host) {
+		domain := resolveFakeDomain(host)
+		if domain != host {
+			dstAddr = fmt.Sprintf("%s:%s", domain, port)
+			logInfo("[FakeDNS] UDP 反查: %s -> %s", host, domain)
+		}
+	}
 
 	logInfo("[UDP] 直接转发: %s", dstAddr)
 

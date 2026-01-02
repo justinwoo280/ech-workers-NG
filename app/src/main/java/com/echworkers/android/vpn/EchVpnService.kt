@@ -4,10 +4,12 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.echworkers.android.MainActivity
@@ -47,7 +49,10 @@ class EchVpnService : VpnService(), core.SocketProtector {
         // 获取当前代理地址
         fun getProxyAddress(): String? = currentProxyAddr
 
-        private const val VPN_MTU = 1500
+        // MTU 优化：考虑协议开销
+        // 1500 - (IP:20 + TCP:20 + TLS:21 + WS:10 + Yamux:12 + ECH:20) = 1397
+        // 设为 1400 留余量
+        private const val VPN_MTU = 1400
         private const val PRIVATE_VLAN4_CLIENT = "10.0.0.2"
         private const val PRIVATE_VLAN4_ROUTER = "10.0.0.1"
         private const val PRIVATE_VLAN6_CLIENT = "fd00::2"
@@ -60,12 +65,32 @@ class EchVpnService : VpnService(), core.SocketProtector {
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
 
     private var localProxyAddr: String? = null
+    
+    // 保活机制
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var heartbeatJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         // 设置 socket 保护器，防止 VPN 流量循环
         Core.setSocketProtector(this)
+        // 获取 WakeLock 保活
+        acquireWakeLock()
+    }
+    
+    private fun acquireWakeLock() {
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "EchVpn::WakeLock"
+            )
+            wakeLock?.acquire()
+            Log.i(TAG, "WakeLock 已获取")
+        } catch (e: Exception) {
+            Log.w(TAG, "获取 WakeLock 失败", e)
+        }
     }
 
     // 实现 SocketProtector 接口 - 保护 socket 不经过 VPN
@@ -164,6 +189,9 @@ class EchVpnService : VpnService(), core.SocketProtector {
                     val statusMsg = "已连接 - $localProxyAddr"
                     updateNotification(statusMsg)
                     Log.i(TAG, "连接成功，代理地址: $localProxyAddr")
+                    
+                    // 启动心跳保活
+                    startHeartbeat()
                     
                     // 广播连接成功和代理地址
                     sendBroadcast(Intent(ACTION_STATE_CHANGED).apply {
@@ -346,8 +374,39 @@ class EchVpnService : VpnService(), core.SocketProtector {
 
     override fun onDestroy() {
         super.onDestroy()
+        heartbeatJob?.cancel()
         serviceJob.cancel()  // 取消所有子协程
         disconnect()
+        releaseWakeLock()
+    }
+    
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.release()
+            wakeLock = null
+            Log.i(TAG, "WakeLock 已释放")
+        } catch (e: Exception) {
+            Log.w(TAG, "释放 WakeLock 失败", e)
+        }
+    }
+    
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                delay(30_000)  // 30 秒心跳
+                
+                try {
+                    // 更新通知时间戳（证明服务还活着）
+                    val timestamp = System.currentTimeMillis() / 1000
+                    updateNotification("已连接 - ${timestamp % 10000}")
+                    Log.d(TAG, "心跳: $timestamp")
+                } catch (e: Exception) {
+                    Log.w(TAG, "心跳失败", e)
+                }
+            }
+        }
+        Log.i(TAG, "心跳已启动")
     }
 
     // OOM 防护：响应系统内存警告
