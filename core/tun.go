@@ -44,7 +44,7 @@ type TunEngine struct {
 	file      *os.File
 	stack     *stack.Stack
 	ep        *channel.Endpoint
-	proxyAddr string
+	transport *WebSocketTransport // 直接引用 transport，不走 SOCKS5
 	mtu       uint32
 	running   atomic.Bool
 	ctx       context.Context
@@ -53,9 +53,26 @@ type TunEngine struct {
 }
 
 var (
-	tunEngine *TunEngine
-	tunMu     sync.Mutex
+	tunEngine       *TunEngine
+	tunMu           sync.Mutex
+	globalTransport *WebSocketTransport // 全局 transport，供 TUN 直接使用
+	transportMu     sync.RWMutex
 )
+
+// SetGlobalTransport 设置全局 transport（由 Client 调用）
+func SetGlobalTransport(t *WebSocketTransport) {
+	transportMu.Lock()
+	defer transportMu.Unlock()
+	globalTransport = t
+	logInfo("[TUN] 全局 transport 已设置")
+}
+
+// GetGlobalTransport 获取全局 transport
+func GetGlobalTransport() *WebSocketTransport {
+	transportMu.RLock()
+	defer transportMu.RUnlock()
+	return globalTransport
+}
 
 // StartTun 启动 TUN 设备处理
 func StartTun(fd int, proxyAddr string, mtu int) error {
@@ -111,12 +128,18 @@ func StartTun(fd int, proxyAddr string, mtu int) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// 获取全局 transport
+	transport := GetGlobalTransport()
+	if transport == nil {
+		return errors.New("global transport not set")
+	}
+
 	engine := &TunEngine{
 		fd:        fd,
 		file:      file,
 		stack:     s,
 		ep:        ep,
-		proxyAddr: proxyAddr,
+		transport: transport,
 		mtu:       uint32(mtu),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -232,37 +255,51 @@ func (t *TunEngine) handleTCP() {
 	logInfo("[TUN] TCP 转发器已注册")
 }
 
-// forwardTCP 通过 SOCKS5 转发 TCP
+// forwardTCP 直接通过 transport 转发 TCP（零拷贝）
 func (t *TunEngine) forwardTCP(local net.Conn, dstAddr string) {
 	defer local.Close()
 
-	logInfo("[TCP] 转发连接: %s", dstAddr)
+	logInfo("[TCP] 直接转发: %s", dstAddr)
 
-	proxy, err := net.DialTimeout("tcp", t.proxyAddr, 10*time.Second)
+	// 直接调用 transport.Dial()，不走 SOCKS5
+	tunnelConn, err := t.transport.Dial()
 	if err != nil {
-		logError("[TCP] 连接代理失败 %s: %v", dstAddr, err)
+		logError("[TCP] 建立隧道失败 %s: %v", dstAddr, err)
 		return
 	}
-	defer proxy.Close()
+	defer tunnelConn.Close()
 
-	if err := socks5Handshake(proxy, dstAddr); err != nil {
-		logError("[TCP] SOCKS5 握手失败 %s: %v", dstAddr, err)
+	// 发送 CONNECT 请求到远程服务器
+	if err := tunnelConn.Connect(dstAddr, nil); err != nil {
+		logError("[TCP] CONNECT 失败 %s: %v", dstAddr, err)
 		return
 	}
 
-	logInfo("[TCP] 已建立连接: %s", dstAddr)
+	logInfo("[TCP] 隧道已建立: %s", dstAddr)
 
+	// 使用适配器使 TunnelConn 兼容 io.ReadWriteCloser
+	tunnel := NewTunnelConnAdapter(tunnelConn)
+
+	// 双向转发（内存直接对接）
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// local -> tunnel
 	go func() {
 		defer wg.Done()
-		io.Copy(proxy, local)
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+		io.CopyBuffer(tunnel, local, buf)
+		tunnel.CloseWrite()
 	}()
 
+	// tunnel -> local
 	go func() {
 		defer wg.Done()
-		io.Copy(local, proxy)
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+		io.CopyBuffer(local, tunnel, buf)
+		local.(*gonet.TCPConn).CloseWrite()
 	}()
 
 	wg.Wait()
@@ -346,55 +383,33 @@ func (t *TunEngine) handleUDP() {
 	logInfo("[TUN] UDP 转发器已注册")
 }
 
-// forwardUDP 通过 SOCKS5 UDP ASSOCIATE 转发 UDP
+// forwardUDP 直接通过 transport 转发 UDP（零拷贝）
 func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	defer local.Close()
 
-	logInfo("[UDP] SOCKS5 转发: %s", dstAddr)
+	logInfo("[UDP] 直接转发: %s", dstAddr)
 
-	// 1. 建立 TCP 控制连接到 SOCKS5 代理
-	tcpConn, err := net.DialTimeout("tcp", t.proxyAddr, 5*time.Second)
+	// 直接调用 transport.Dial()，不走 SOCKS5
+	tunnelConn, err := t.transport.Dial()
 	if err != nil {
-		logError("[UDP] 连接 SOCKS5 失败 %s: %v", dstAddr, err)
+		logError("[UDP] 建立隧道失败 %s: %v", dstAddr, err)
 		return
 	}
-	defer tcpConn.Close()
+	defer tunnelConn.Close()
 
-	// 2. SOCKS5 UDP ASSOCIATE 握手
-	udpRelayAddr, err := socks5UDPAssociate(tcpConn)
-	if err != nil {
-		logError("[UDP] UDP ASSOCIATE 失败 %s: %v", dstAddr, err)
-		return
-	}
-
-	// 如果返回 0.0.0.0，使用代理地址
-	if udpRelayAddr == "0.0.0.0:0" || udpRelayAddr == "" {
-		udpRelayAddr = t.proxyAddr
-	}
-
-	logInfo("[UDP] UDP 中继: %s -> %s", udpRelayAddr, dstAddr)
-
-	// 3. 连接到 UDP 中继服务器
-	udpAddr, err := net.ResolveUDPAddr("udp", udpRelayAddr)
-	if err != nil {
-		logError("[UDP] 解析中继地址失败 %s: %v", udpRelayAddr, err)
+	// 发送 UDP CONNECT 请求到远程服务器
+	// 使用特殊标记告诉服务器这是 UDP 连接
+	if err := tunnelConn.Connect("udp://"+dstAddr, nil); err != nil {
+		logError("[UDP] CONNECT 失败 %s: %v", dstAddr, err)
 		return
 	}
 
-	udpConn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		logError("[UDP] 连接中继失败 %s: %v", udpRelayAddr, err)
-		return
-	}
-	defer udpConn.Close()
+	logInfo("[UDP] 隧道已建立: %s", dstAddr)
 
-	// 设置超时
-	udpConn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// 4. 双向转发
+	// 双向转发（内存直接对接）
 	done := make(chan struct{}, 2)
 
-	// local -> SOCKS5 UDP relay
+	// local -> tunnel
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 2048)
@@ -404,37 +419,26 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 				break
 			}
 
-			// 封装 SOCKS5 UDP 包
-			packet := buildSocks5UDPPacket(dstAddr, buf[:n])
-			if _, err := udpConn.Write(packet); err != nil {
+			if err := tunnelConn.Write(buf[:n]); err != nil {
 				logError("[UDP] 发送失败 %s: %v", dstAddr, err)
 				break
 			}
-
-			udpConn.SetDeadline(time.Now().Add(30 * time.Second))
 		}
 	}()
 
-	// SOCKS5 UDP relay -> local
+	// tunnel -> local
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buf := make([]byte, 2048)
 		for {
-			n, err := udpConn.Read(buf)
+			data, err := tunnelConn.Read()
 			if err != nil {
 				break
 			}
 
-			// 解析 SOCKS5 UDP 包
-			data := parseSocks5UDPPacket(buf[:n])
-			if data != nil && len(data) > 0 {
-				if _, err := local.Write(data); err != nil {
-					logError("[UDP] 写回失败 %s: %v", dstAddr, err)
-					break
-				}
+			if _, err := local.Write(data); err != nil {
+				logError("[UDP] 写回失败 %s: %v", dstAddr, err)
+				break
 			}
-
-			udpConn.SetDeadline(time.Now().Add(30 * time.Second))
 		}
 	}()
 

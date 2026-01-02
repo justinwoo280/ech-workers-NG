@@ -278,6 +278,9 @@ func (c *Client) Start() error {
 		c.config.EnableECH,
 		c.config.EnableYamux)
 
+	// 设置全局 transport 供 TUN 直接使用（零拷贝）
+	SetGlobalTransport(c.transport)
+
 	// 启动本地 SOCKS5 代理
 	var err error
 	c.listener, err = net.Listen("tcp", c.config.LocalAddr)
@@ -1086,6 +1089,61 @@ type TunnelConn interface {
 	Read() ([]byte, error)
 	Write(data []byte) error
 	Close() error
+}
+
+// TunnelConnAdapter 适配器，使 TunnelConn 兼容 io.ReadWriteCloser
+type TunnelConnAdapter struct {
+	conn TunnelConn
+	buf  []byte
+	pos  int
+}
+
+func NewTunnelConnAdapter(conn TunnelConn) *TunnelConnAdapter {
+	return &TunnelConnAdapter{conn: conn}
+}
+
+func (a *TunnelConnAdapter) Read(p []byte) (int, error) {
+	// 如果缓冲区有数据，先返回缓冲区的
+	if a.pos < len(a.buf) {
+		n := copy(p, a.buf[a.pos:])
+		a.pos += n
+		if a.pos >= len(a.buf) {
+			a.buf = nil
+			a.pos = 0
+		}
+		return n, nil
+	}
+
+	// 从 tunnel 读取新数据
+	data, err := a.conn.Read()
+	if err != nil {
+		return 0, err
+	}
+
+	// 复制到 p
+	n := copy(p, data)
+	if n < len(data) {
+		// 数据没读完，保存到缓冲区
+		a.buf = data
+		a.pos = n
+	}
+	return n, nil
+}
+
+func (a *TunnelConnAdapter) Write(p []byte) (int, error) {
+	if err := a.conn.Write(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (a *TunnelConnAdapter) Close() error {
+	return a.conn.Close()
+}
+
+func (a *TunnelConnAdapter) CloseWrite() error {
+	// TunnelConn 不支持半关闭，忽略
+	return nil
 }
 
 type WebSocketTransport struct {
