@@ -504,12 +504,23 @@ func (c *Client) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// 解析 SOCKS5 请求
-	target, initialData, err := parseSocks5(conn)
+	cmd, target, initialData, err := parseSocks5WithCommand(conn)
 	if err != nil {
 		logError("SOCKS5 解析错误: %v", err)
 		return
 	}
 
+	switch cmd {
+	case 0x01: // CONNECT (TCP)
+		c.handleTCPConnect(conn, target, initialData)
+	case 0x03: // UDP ASSOCIATE
+		c.handleUDPAssociate(conn)
+	default:
+		logError("不支持的命令: 0x%02x", cmd)
+	}
+}
+
+func (c *Client) handleTCPConnect(conn net.Conn, target string, initialData []byte) {
 	logInfo("[SOCKS5] %s -> %s", conn.RemoteAddr(), target)
 
 	// 建立隧道连接
@@ -549,77 +560,326 @@ func (c *Client) fetchECHConfig() ([]byte, error) {
 
 // ======================== SOCKS5 协议解析 ========================
 
-func parseSocks5(conn net.Conn) (string, []byte, error) {
+// parseSocks5WithCommand 解析 SOCKS5 请求并返回命令类型
+func parseSocks5WithCommand(conn net.Conn) (byte, string, []byte, error) {
 	buf := make([]byte, 256)
 
 	// 读取版本和方法数
 	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return "", nil, err
+		return 0, "", nil, err
 	}
 
 	if buf[0] != 0x05 {
-		return "", nil, errors.New("不支持的 SOCKS 版本")
+		return 0, "", nil, errors.New("不支持的 SOCKS 版本")
 	}
 
 	nmethods := int(buf[1])
 	if _, err := io.ReadFull(conn, buf[:nmethods]); err != nil {
-		return "", nil, err
+		return 0, "", nil, err
 	}
 
 	// 回复：无需认证
 	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
-		return "", nil, err
+		return 0, "", nil, err
 	}
 
 	// 读取请求
 	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
-		return "", nil, err
+		return 0, "", nil, err
 	}
 
-	if buf[0] != 0x05 || buf[1] != 0x01 {
-		return "", nil, errors.New("不支持的 SOCKS5 命令")
+	if buf[0] != 0x05 {
+		return 0, "", nil, errors.New("不支持的 SOCKS 版本")
+	}
+
+	cmd := buf[1]
+	// 支持 0x01 (CONNECT) 和 0x03 (UDP ASSOCIATE)
+	if cmd != 0x01 && cmd != 0x03 {
+		return 0, "", nil, fmt.Errorf("不支持的 SOCKS5 命令: 0x%02x", cmd)
 	}
 
 	var host string
 	switch buf[3] {
 	case 0x01: // IPv4
 		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
-			return "", nil, err
+			return 0, "", nil, err
 		}
 		host = net.IP(buf[:4]).String()
 	case 0x03: // 域名
 		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
-			return "", nil, err
+			return 0, "", nil, err
 		}
 		domainLen := int(buf[0])
 		if _, err := io.ReadFull(conn, buf[:domainLen]); err != nil {
-			return "", nil, err
+			return 0, "", nil, err
 		}
 		host = string(buf[:domainLen])
 	case 0x04: // IPv6
 		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
-			return "", nil, err
+			return 0, "", nil, err
 		}
 		host = net.IP(buf[:16]).String()
 	default:
-		return "", nil, errors.New("不支持的地址类型")
+		return 0, "", nil, errors.New("不支持的地址类型")
 	}
 
 	// 读取端口
 	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return "", nil, err
+		return 0, "", nil, err
 	}
 	port := int(buf[0])<<8 | int(buf[1])
 
 	target := fmt.Sprintf("%s:%d", host, port)
 
-	// 回复成功
-	reply := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	if _, err := conn.Write(reply); err != nil {
-		return "", nil, err
+	// 对于 UDP ASSOCIATE，不需要立即回复，由 handleUDPAssociate 处理
+	if cmd == 0x01 {
+		// TCP CONNECT 回复成功
+		reply := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		if _, err := conn.Write(reply); err != nil {
+			return 0, "", nil, err
+		}
 	}
 
-	return target, nil, nil
+	return cmd, target, nil, nil
+}
+
+// handleUDPAssociate 处理 UDP ASSOCIATE 请求
+func (c *Client) handleUDPAssociate(tcpConn net.Conn) {
+	logInfo("[UDP ASSOCIATE] 客户端: %s", tcpConn.RemoteAddr())
+
+	// 创建 UDP 中继服务器
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		logError("[UDP] 解析地址失败: %v", err)
+		return
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		logError("[UDP] 创建 UDP 服务器失败: %v", err)
+		return
+	}
+	defer udpConn.Close()
+
+	// 获取实际绑定的地址
+	boundAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	logInfo("[UDP] UDP 中继服务器: %s", boundAddr.String())
+
+	// 回复 UDP ASSOCIATE 成功，告知客户端 UDP 地址
+	reply := []byte{0x05, 0x00, 0x00, 0x01}
+	reply = append(reply, boundAddr.IP.To4()...)
+	reply = append(reply, byte(boundAddr.Port>>8), byte(boundAddr.Port))
+
+	if _, err := tcpConn.Write(reply); err != nil {
+		logError("[UDP] 发送回复失败: %v", err)
+		return
+	}
+
+	// 启动 UDP 中继
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 监控 TCP 连接，断开时停止 UDP 中继
+	go func() {
+		buf := make([]byte, 1)
+		tcpConn.Read(buf) // 阻塞直到连接断开
+		cancel()
+	}()
+
+	// UDP 中继循环
+	c.udpRelay(ctx, udpConn)
+}
+
+// udpRelay UDP 数据中继
+func (c *Client) udpRelay(ctx context.Context, udpConn *net.UDPConn) {
+	// 客户端地址映射到远程连接
+	type udpSession struct {
+		remoteConn *net.UDPConn
+		lastActive time.Time
+	}
+	sessions := make(map[string]*udpSession)
+	sessionsMu := sync.Mutex{}
+
+	// 清理超时会话
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sessionsMu.Lock()
+				now := time.Now()
+				for key, sess := range sessions {
+					if now.Sub(sess.lastActive) > 60*time.Second {
+						sess.remoteConn.Close()
+						delete(sessions, key)
+						logInfo("[UDP] 会话超时: %s", key)
+					}
+				}
+				sessionsMu.Unlock()
+			}
+		}
+	}()
+
+	// 接收来自客户端的 UDP 包
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, clientAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return
+		}
+
+		// 解析 SOCKS5 UDP 包
+		dstAddr, data := parseSocks5UDPRequest(buf[:n])
+		if dstAddr == "" {
+			continue
+		}
+
+		clientKey := clientAddr.String()
+
+		// 获取或创建会话
+		sessionsMu.Lock()
+		sess, exists := sessions[clientKey]
+		if !exists {
+			// 创建新的远程连接
+			remoteAddr, err := net.ResolveUDPAddr("udp", dstAddr)
+			if err != nil {
+				sessionsMu.Unlock()
+				continue
+			}
+
+			remoteConn, err := net.DialUDP("udp", nil, remoteAddr)
+			if err != nil {
+				sessionsMu.Unlock()
+				continue
+			}
+
+			sess = &udpSession{
+				remoteConn: remoteConn,
+				lastActive: time.Now(),
+			}
+			sessions[clientKey] = sess
+
+			logInfo("[UDP] 新会话: %s -> %s", clientKey, dstAddr)
+
+			// 启动接收远程响应的协程
+			go func(s *udpSession, cAddr *net.UDPAddr, dst string) {
+				respBuf := make([]byte, 65535)
+				for {
+					s.remoteConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+					n, err := s.remoteConn.Read(respBuf)
+					if err != nil {
+						return
+					}
+
+					// 封装 SOCKS5 UDP 响应
+					response := buildSocks5UDPResponse(dst, respBuf[:n])
+					udpConn.WriteToUDP(response, cAddr)
+
+					sessionsMu.Lock()
+					s.lastActive = time.Now()
+					sessionsMu.Unlock()
+				}
+			}(sess, clientAddr, dstAddr)
+		}
+		sess.lastActive = time.Now()
+		sessionsMu.Unlock()
+
+		// 转发数据到远程
+		sess.remoteConn.Write(data)
+	}
+}
+
+// parseSocks5UDPRequest 解析 SOCKS5 UDP 请求包
+func parseSocks5UDPRequest(packet []byte) (string, []byte) {
+	if len(packet) < 10 {
+		return "", nil
+	}
+
+	// SOCKS5 UDP 包格式: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT + DATA
+	offset := 3 // 跳过 RSV 和 FRAG
+	atyp := packet[offset]
+	offset++
+
+	var host string
+	var port int
+
+	switch atyp {
+	case 0x01: // IPv4
+		if len(packet) < offset+6 {
+			return "", nil
+		}
+		host = net.IP(packet[offset : offset+4]).String()
+		offset += 4
+	case 0x03: // Domain
+		if len(packet) < offset+1 {
+			return "", nil
+		}
+		length := int(packet[offset])
+		offset++
+		if len(packet) < offset+length {
+			return "", nil
+		}
+		host = string(packet[offset : offset+length])
+		offset += length
+	case 0x04: // IPv6
+		if len(packet) < offset+18 {
+			return "", nil
+		}
+		host = net.IP(packet[offset : offset+16]).String()
+		offset += 16
+	default:
+		return "", nil
+	}
+
+	if len(packet) < offset+2 {
+		return "", nil
+	}
+	port = int(packet[offset])<<8 | int(packet[offset+1])
+	offset += 2
+
+	dstAddr := fmt.Sprintf("%s:%d", host, port)
+	data := packet[offset:]
+
+	return dstAddr, data
+}
+
+// buildSocks5UDPResponse 构建 SOCKS5 UDP 响应包
+func buildSocks5UDPResponse(dstAddr string, data []byte) []byte {
+	host, portStr, _ := net.SplitHostPort(dstAddr)
+	port := 0
+	fmt.Sscanf(portStr, "%d", &port)
+
+	packet := []byte{0x00, 0x00, 0x00} // RSV, FRAG
+
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			packet = append(packet, 0x01)
+			packet = append(packet, ip4...)
+		} else {
+			packet = append(packet, 0x04)
+			packet = append(packet, ip.To16()...)
+		}
+	} else {
+		packet = append(packet, 0x03, byte(len(host)))
+		packet = append(packet, []byte(host)...)
+	}
+
+	packet = append(packet, byte(port>>8), byte(port))
+	packet = append(packet, data...)
+	return packet
 }
 
 // ======================== 数据转发 ========================
