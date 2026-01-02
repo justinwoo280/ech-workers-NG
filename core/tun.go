@@ -39,6 +39,13 @@ var bufPool = sync.Pool{
 	},
 }
 
+// DNS 缓冲池（512 字节，用于 DNS 查询）
+var dnsBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 512)
+	},
+}
+
 // TunEngine TUN 引擎
 type TunEngine struct {
 	fd        int
@@ -547,7 +554,9 @@ func (t *TunEngine) handleUDP() {
 func (t *TunEngine) handleDNS(conn *gonet.UDPConn, dnsServer string) {
 	defer conn.Close()
 
-	buf := make([]byte, 512)
+	buf := dnsBufPool.Get().([]byte)
+	defer dnsBufPool.Put(buf)
+
 	n, _, err := conn.ReadFrom(buf)
 	if err != nil {
 		return
@@ -560,9 +569,20 @@ func (t *TunEngine) handleDNS(conn *gonet.UDPConn, dnsServer string) {
 		return
 	}
 
-	// 只处理 A 记录查询
-	if len(query.Question) == 0 || query.Question[0].Qtype != dns.TypeA {
-		logError("[FakeDNS] 非 A 记录查询，忽略")
+	if len(query.Question) == 0 {
+		return
+	}
+
+	// 对于非 A 记录查询（特别是 AAAA），立即回复空响应，防止客户端超时等待
+	if query.Question[0].Qtype != dns.TypeA {
+		resp := new(dns.Msg)
+		resp.SetReply(query)
+		resp.Rcode = dns.RcodeSuccess // 域名存在，但没有该类型记录 (NODATA)
+
+		if out, err := resp.Pack(); err == nil {
+			conn.Write(out)
+		}
+		logInfo("[FakeDNS] 非 A 记录查询 (%s)，返回 NODATA", dns.TypeToString[query.Question[0].Qtype])
 		return
 	}
 
