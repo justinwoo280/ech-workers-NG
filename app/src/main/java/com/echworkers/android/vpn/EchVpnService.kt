@@ -221,8 +221,6 @@ class EchVpnService : VpnService(), core.SocketProtector {
             .addAddress(PRIVATE_VLAN4_CLIENT, 30)
             .addRoute("0.0.0.0", 0)
             .addDnsServer(PRIVATE_VLAN4_ROUTER)  // 使用 VPN 内部 DNS (10.0.0.1)，由 FakeDNS 处理
-            // FakeDNS IP 范围路由 (198.18.0.0/15)
-            .addRoute("198.18.0.0", 15)
 
         // IPv6 支持
         try {

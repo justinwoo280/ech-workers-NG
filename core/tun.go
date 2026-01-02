@@ -395,7 +395,9 @@ func (t *TunEngine) handleTCP() {
 	fwd := tcp.NewForwarder(t.stack, 0, 65535, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		// 修复：使用 RemoteAddress (真实目标) 而不是 LocalAddress (VPN 内部地址)
+		srcAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 		dstAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
+		logInfo("[TCP] 连接: %s -> %s", srcAddr, dstAddr)
 
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
@@ -534,7 +536,9 @@ func (t *TunEngine) handleUDP() {
 
 	fwd := udp.NewForwarder(t.stack, func(r *udp.ForwarderRequest) {
 		id := r.ID()
+		srcAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 		dstAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
+		logInfo("[UDP] 连接: %s -> %s", srcAddr, dstAddr)
 
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
@@ -547,6 +551,7 @@ func (t *TunEngine) handleUDP() {
 
 		// 拦截 DNS 请求 (端口 53)
 		if id.RemotePort == 53 {
+			logInfo("[FakeDNS] 拦截 DNS 查询: %s -> %s", id.LocalAddress.String(), dstAddr)
 			go t.handleDNS(conn, id.RemoteAddress.String())
 			return
 		}
