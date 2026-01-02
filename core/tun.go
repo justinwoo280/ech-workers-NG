@@ -346,42 +346,22 @@ func (t *TunEngine) handleUDP() {
 	logInfo("[TUN] UDP 转发器已注册")
 }
 
-// forwardUDP 通过 SOCKS5 UDP ASSOCIATE 转发 UDP
+// forwardUDP 直接转发 UDP (不通过 SOCKS5，因为本地代理不支持 UDP ASSOCIATE)
 func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	defer local.Close()
 
-	// 连接到 SOCKS5 代理
-	proxy, err := net.DialTimeout("tcp", t.proxyAddr, 5*time.Second)
+	logInfo("[UDP] 直接转发: %s", dstAddr)
+
+	// 直接连接到目标地址 (不走 SOCKS5)
+	udpAddr, err := net.ResolveUDPAddr("udp", dstAddr)
 	if err != nil {
-		logError("[UDP] 连接代理失败: %v", err)
-		return
-	}
-	defer proxy.Close()
-
-	// SOCKS5 UDP ASSOCIATE 握手，获取 UDP 中继地址
-	udpRelayAddr, err := socks5UDPAssociate(proxy)
-	if err != nil {
-		logError("[UDP] SOCKS5 UDP ASSOCIATE 失败: %v", err)
-		return
-	}
-
-	// 如果返回 0.0.0.0，使用代理服务器地址
-	if udpRelayAddr == "0.0.0.0:0" || udpRelayAddr == "" {
-		udpRelayAddr = t.proxyAddr
-	}
-
-	logInfo("[UDP] UDP 中继地址: %s, 目标: %s", udpRelayAddr, dstAddr)
-
-	// 创建 UDP socket 用于实际数据传输
-	udpAddr, err := net.ResolveUDPAddr("udp", udpRelayAddr)
-	if err != nil {
-		logError("[UDP] 解析 UDP 地址失败: %v", err)
+		logError("[UDP] 解析目标地址失败 %s: %v", dstAddr, err)
 		return
 	}
 
 	udpConn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
-		logError("[UDP] 创建 UDP 连接失败: %v", err)
+		logError("[UDP] 连接目标失败 %s: %v", dstAddr, err)
 		return
 	}
 	defer udpConn.Close()
@@ -392,7 +372,7 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	// 双向转发
 	done := make(chan struct{}, 2)
 
-	// local -> proxy (客户端发送数据，如 DNS 查询)
+	// local -> remote (客户端发送数据，如 DNS 查询)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 2048)
@@ -402,10 +382,9 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 				break
 			}
 
-			// 封装 SOCKS5 UDP 包
-			packet := buildSocks5UDPPacket(dstAddr, buf[:n])
-			if _, err := udpConn.Write(packet); err != nil {
-				logError("[UDP] 发送到代理失败: %v", err)
+			// 直接发送原始数据 (不封装 SOCKS5)
+			if _, err := udpConn.Write(buf[:n]); err != nil {
+				logError("[UDP] 发送失败 %s: %v", dstAddr, err)
 				break
 			}
 
@@ -414,7 +393,7 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 		}
 	}()
 
-	// proxy -> local (服务器响应数据，如 DNS 响应)
+	// remote -> local (服务器响应数据，如 DNS 响应)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 2048)
@@ -424,14 +403,10 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 				break
 			}
 
-			// 解析 SOCKS5 UDP 包
-			data := parseSocks5UDPPacket(buf[:n])
-			if data != nil && len(data) > 0 {
-				// 写回客户端
-				if _, err := local.Write(data); err != nil {
-					logError("[UDP] 写回客户端失败: %v", err)
-					break
-				}
+			// 直接写回原始数据 (不解析 SOCKS5)
+			if _, err := local.Write(buf[:n]); err != nil {
+				logError("[UDP] 写回失败 %s: %v", dstAddr, err)
+				break
 			}
 
 			// 重置超时
@@ -441,6 +416,7 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 
 	// 等待任一方向结束或超时
 	<-done
+	logInfo("[UDP] 连接关闭: %s", dstAddr)
 }
 
 // socks5UDPAssociate SOCKS5 UDP ASSOCIATE 握手，返回 UDP 中继地址
