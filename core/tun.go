@@ -635,9 +635,9 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 		}
 	}
 
-	logInfo("[UDP] 直接转发: %s", dstAddr)
+	logInfo("[UDP] 通过 TCP 隧道转发: %s", dstAddr)
 
-	// 直接调用 transport.Dial()，不走 SOCKS5
+	// UDP over TCP: 将 UDP 数据包封装在 TCP 连接中
 	tunnelConn, err := t.transport.Dial()
 	if err != nil {
 		logError("[UDP] 建立隧道失败 %s: %v", dstAddr, err)
@@ -645,19 +645,18 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	}
 	defer tunnelConn.Close()
 
-	// 发送 UDP CONNECT 请求到远程服务器
-	// 使用特殊标记告诉服务器这是 UDP 连接
-	if err := tunnelConn.Connect("udp://"+dstAddr, nil); err != nil {
+	// 发送 CONNECT 请求（TCP 连接）
+	if err := tunnelConn.Connect(dstAddr, nil); err != nil {
 		logError("[UDP] CONNECT 失败 %s: %v", dstAddr, err)
 		return
 	}
 
-	logInfo("[UDP] 隧道已建立: %s", dstAddr)
+	logInfo("[UDP] TCP 隧道已建立: %s", dstAddr)
 
-	// 双向转发（内存直接对接）
+	// 双向转发（UDP over TCP）
 	done := make(chan struct{}, 2)
 
-	// local -> tunnel
+	// local UDP -> tunnel TCP
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 2048)
@@ -667,23 +666,43 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 				break
 			}
 
-			if err := tunnelConn.Write(buf[:n]); err != nil {
+			// 封装：2 字节长度 + UDP 数据
+			packet := make([]byte, 2+n)
+			packet[0] = byte(n >> 8)
+			packet[1] = byte(n)
+			copy(packet[2:], buf[:n])
+
+			if err := tunnelConn.Write(packet); err != nil {
 				logError("[UDP] 发送失败 %s: %v", dstAddr, err)
 				break
 			}
 		}
 	}()
 
-	// tunnel -> local
+	// tunnel TCP -> local UDP
 	go func() {
 		defer func() { done <- struct{}{} }()
 		for {
+			// 读取数据
 			data, err := tunnelConn.Read()
 			if err != nil {
 				break
 			}
 
-			if _, err := local.Write(data); err != nil {
+			// 解析长度前缀（2 字节）
+			if len(data) < 2 {
+				continue
+			}
+
+			length := int(data[0])<<8 | int(data[1])
+
+			if len(data) < 2+length {
+				logError("[UDP] 数据包长度不匹配: 期望 %d, 实际 %d", length, len(data)-2)
+				continue
+			}
+
+			// 提取 UDP 数据并发送
+			if _, err := local.Write(data[2 : 2+length]); err != nil {
 				logError("[UDP] 写回失败 %s: %v", dstAddr, err)
 				break
 			}
