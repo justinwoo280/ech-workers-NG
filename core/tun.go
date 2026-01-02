@@ -266,6 +266,16 @@ func StartTun(fd int, proxyAddr string, mtu int) error {
 		return fmt.Errorf("create NIC: %v", err)
 	}
 
+	// 添加 IP 地址 (10.0.0.1 - VPN 网关地址)
+	protocolAddr := tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFromSlice([]byte{10, 0, 0, 1}).WithPrefix(),
+	}
+	if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+		s.Close()
+		return fmt.Errorf("add protocol address: %v", err)
+	}
+
 	// 设置路由
 	s.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},

@@ -215,17 +215,14 @@ class EchVpnService : VpnService(), core.SocketProtector {
     }
 
     private fun establishVpn() {
-        // 加载 DNS 配置
-        val configService = com.echworkers.android.service.ConfigService(this)
-        val config = configService.load()
-        val fallbackDns = config.dnsConfig.fallbackDns.ifEmpty { "1.1.1.1" }
-
         val builder = Builder()
             .setSession("ECH Workers VPN")
             .setMtu(VPN_MTU)
             .addAddress(PRIVATE_VLAN4_CLIENT, 30)
             .addRoute("0.0.0.0", 0)
-            .addDnsServer(fallbackDns)  // 使用配置的 DNS
+            .addDnsServer(PRIVATE_VLAN4_ROUTER)  // 使用 VPN 内部 DNS (10.0.0.1)，由 FakeDNS 处理
+            // FakeDNS IP 范围路由 (198.18.0.0/15)
+            .addRoute("198.18.0.0", 15)
 
         // IPv6 支持
         try {
