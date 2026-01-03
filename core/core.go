@@ -75,8 +75,10 @@ func createProtectedHTTPClient() *http.Client {
 			if tcpConn, ok := conn.(*net.TCPConn); ok {
 				rawConn, err := tcpConn.SyscallConn()
 				if err == nil {
-					rawConn.Control(func(fd uintptr) {
+					// 使用 Read 而不是 Control，避免 fdsan 所有权冲突
+					rawConn.Read(func(fd uintptr) bool {
 						protectSocket(int(fd))
+						return true
 					})
 				}
 			}
@@ -1307,17 +1309,23 @@ func (t *WebSocketTransport) dialWebSocket() (*websocket.Conn, error) {
 			return nil, err
 		}
 		
-		// 保护 socket，防止 VPN 流量循环（必须用 SyscallConn 获取原始 fd）
+		// 保护 socket，防止 VPN 流量循环
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			rawConn, err := tcpConn.SyscallConn()
 			if err == nil {
-				rawConn.Control(func(fd uintptr) {
+				var protectErr error
+				// 使用 Read 而不是 Control，避免 fdsan 所有权冲突
+				rawConn.Read(func(fd uintptr) bool {
 					if !protectSocket(int(fd)) {
-						logError("警告: 无法保护 socket fd=%d", fd)
-					} else {
-						logInfo("Socket fd=%d 已保护", fd)
+						protectErr = fmt.Errorf("无法保护 socket fd=%d", fd)
+						return false
 					}
+					logInfo("Socket fd=%d 已保护", fd)
+					return true
 				})
+				if protectErr != nil {
+					logError("警告: %v", protectErr)
+				}
 			} else {
 				logError("获取 SyscallConn 失败: %v", err)
 			}
