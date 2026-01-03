@@ -3,6 +3,8 @@ package com.echworkers.android
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.MenuItem
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -20,6 +22,7 @@ class AppProxyActivity : AppCompatActivity() {
     private lateinit var adapter: AppListAdapter
     private val configService by lazy { ConfigService(this) }
     private var selectedApps = mutableSetOf<String>()
+    private var allApps = listOf<ApplicationInfo>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,6 +56,15 @@ class AppProxyActivity : AppCompatActivity() {
         binding.recyclerApps.layoutManager = LinearLayoutManager(this)
         binding.recyclerApps.adapter = adapter
 
+        // 搜索功能
+        binding.etSearch.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                filterApps(s?.toString() ?: "")
+            }
+        })
+
         binding.btnSave.setOnClickListener {
             saveConfig()
             finish()
@@ -61,13 +73,26 @@ class AppProxyActivity : AppCompatActivity() {
 
     private fun loadApps() {
         lifecycleScope.launch {
-            val apps = withContext(Dispatchers.IO) {
+            allApps = withContext(Dispatchers.IO) {
                 packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
                     .filter { it.flags and ApplicationInfo.FLAG_SYSTEM == 0 }
                     .sortedBy { packageManager.getApplicationLabel(it).toString() }
             }
-            adapter.submitList(apps)
+            adapter.submitList(allApps)
         }
+    }
+
+    private fun filterApps(query: String) {
+        val filtered = if (query.isEmpty()) {
+            allApps
+        } else {
+            allApps.filter {
+                val label = packageManager.getApplicationLabel(it).toString()
+                val packageName = it.packageName
+                label.contains(query, ignoreCase = true) || packageName.contains(query, ignoreCase = true)
+            }
+        }
+        adapter.submitList(filtered)
     }
 
     private fun saveConfig() {

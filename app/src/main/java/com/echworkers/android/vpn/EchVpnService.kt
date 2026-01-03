@@ -230,9 +230,6 @@ class EchVpnService : VpnService(), core.SocketProtector {
             Log.w(TAG, "IPv6 配置失败", e)
         }
 
-        // 排除本地代理地址
-        builder.addDisallowedApplication(packageName)
-
         // 加载分应用代理配置
         loadPerAppProxyConfig(builder)
 
@@ -264,6 +261,8 @@ class EchVpnService : VpnService(), core.SocketProtector {
                     "blacklist" -> {
                         // 黑名单模式：列表中的应用不走代理
                         Log.i(TAG, "分应用代理：黑名单模式，${config.perAppProxyApps.size} 个应用")
+                        // 黑名单模式下，始终排除 VPN 应用自己
+                        builder.addDisallowedApplication(packageName)
                         config.perAppProxyApps.forEach { packageName ->
                             try {
                                 builder.addDisallowedApplication(packageName)
@@ -274,7 +273,9 @@ class EchVpnService : VpnService(), core.SocketProtector {
                     }
                 }
             } else {
+                // 全局模式：所有应用走代理，但排除 VPN 应用自己
                 Log.i(TAG, "分应用代理：全局模式")
+                builder.addDisallowedApplication(packageName)
             }
         } catch (e: Exception) {
             Log.e(TAG, "加载分应用代理配置失败", e)
