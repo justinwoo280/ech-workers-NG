@@ -23,6 +23,7 @@ class AppProxyActivity : AppCompatActivity() {
     private val configService by lazy { ConfigService(this) }
     private var selectedApps = mutableSetOf<String>()
     private var allApps = listOf<ApplicationInfo>()
+    private var showSystemApps = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,9 +62,15 @@ class AppProxyActivity : AppCompatActivity() {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
             override fun afterTextChanged(s: Editable?) {
-                filterApps(s?.toString() ?: "")
+                filterApps()
             }
         })
+
+        // 系统应用开关
+        binding.switchShowSystem.setOnCheckedChangeListener { _, isChecked ->
+            showSystemApps = isChecked
+            loadApps()
+        }
 
         binding.btnSave.setOnClickListener {
             saveConfig()
@@ -75,21 +82,29 @@ class AppProxyActivity : AppCompatActivity() {
         lifecycleScope.launch {
             allApps = withContext(Dispatchers.IO) {
                 packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-                    .filter { it.flags and ApplicationInfo.FLAG_SYSTEM == 0 }
+                    .filter { app ->
+                        // 根据开关决定是否显示系统应用
+                        if (showSystemApps) {
+                            true
+                        } else {
+                            app.flags and ApplicationInfo.FLAG_SYSTEM == 0
+                        }
+                    }
                     .sortedBy { packageManager.getApplicationLabel(it).toString() }
             }
-            adapter.submitList(allApps)
+            filterApps()
         }
     }
 
-    private fun filterApps(query: String) {
+    private fun filterApps() {
+        val query = binding.etSearch.text?.toString() ?: ""
         val filtered = if (query.isEmpty()) {
             allApps
         } else {
             allApps.filter {
+                // 只搜索应用名称，不搜索包名（更符合用户习惯）
                 val label = packageManager.getApplicationLabel(it).toString()
-                val packageName = it.packageName
-                label.contains(query, ignoreCase = true) || packageName.contains(query, ignoreCase = true)
+                label.contains(query, ignoreCase = true)
             }
         }
         adapter.submitList(filtered)
