@@ -519,6 +519,8 @@ func (c *Client) handleTCPConnect(conn net.Conn, target string, initialData []by
 	tunnel, err := c.transport.Dial()
 	if err != nil {
 		logError("隧道连接失败: %v", err)
+		// 返回 SOCKS5 错误响应
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		return
 	}
 	defer tunnel.Close()
@@ -526,6 +528,15 @@ func (c *Client) handleTCPConnect(conn net.Conn, target string, initialData []by
 	// 发送 CONNECT 请求
 	if err := tunnel.Connect(target, initialData); err != nil {
 		logError("CONNECT 失败: %v", err)
+		// 返回 SOCKS5 错误响应
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+
+	// 连接成功，返回 SOCKS5 成功响应
+	reply := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	if _, err := conn.Write(reply); err != nil {
+		logError("发送 SOCKS5 响应失败: %v", err)
 		return
 	}
 
@@ -623,14 +634,9 @@ func parseSocks5WithCommand(conn net.Conn) (byte, string, []byte, error) {
 
 	target := fmt.Sprintf("%s:%d", host, port)
 
-	// 对于 UDP ASSOCIATE，不需要立即回复，由 handleUDPAssociate 处理
-	if cmd == 0x01 {
-		// TCP CONNECT 回复成功
-		reply := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-		if _, err := conn.Write(reply); err != nil {
-			return 0, "", nil, err
-		}
-	}
+	// 注意：不在这里回复 SOCKS5 响应
+	// TCP CONNECT 的响应应该在真正连接成功后才发送
+	// UDP ASSOCIATE 的响应由 handleUDPAssociate 处理
 
 	return cmd, target, nil, nil
 }
