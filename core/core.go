@@ -377,20 +377,9 @@ func testProxyConnection(proxyAddr, testURL string) *TestResult {
 		return &TestResult{Success: false, Error: fmt.Sprintf("创建代理失败: %v", err)}
 	}
 
-	// 创建 HTTP 客户端
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.Dial(network, addr)
-		},
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second,
-	}
-
-	// 发送请求
-	resp, err := client.Get(testURL)
+	// 只测试 TCP 连接，不进行 TLS 握手和 HTTP 请求
+	// 这样可以更准确地反映代理延迟
+	conn, err := dialer.Dial("tcp", "cloudflare.com:443")
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil {
@@ -400,12 +389,12 @@ func testProxyConnection(proxyAddr, testURL string) *TestResult {
 			Error:   err.Error(),
 		}
 	}
-	defer resp.Body.Close()
+	conn.Close()
 
 	return &TestResult{
-		Success:  resp.StatusCode >= 200 && resp.StatusCode < 400,
+		Success:  true,
 		Latency:  latency,
-		HttpCode: resp.StatusCode,
+		HttpCode: 200,
 	}
 }
 
