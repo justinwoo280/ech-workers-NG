@@ -30,6 +30,9 @@ import (
 const (
 	nicID       = 1
 	channelSize = 512
+
+	// UDP over TCP 最大包长（64KB）
+	MaxUDPPacketSize = 64 * 1024
 )
 
 // 缓冲池
@@ -682,10 +685,10 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	// tunnel TCP -> local UDP
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buffer := make([]byte, 0, 65535) // 缓冲区，用于处理 TCP 流的粘包/拆包
+		buffer := make([]byte, 0, MaxUDPPacketSize+2)
 		
 		for {
-			// 读取数据
+			// 读取数据（WebSocket 返回完整消息）
 			data, err := tunnelConn.Read()
 			if err != nil {
 				break
@@ -699,6 +702,12 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 				// 读取长度前缀
 				length := int(buffer[0])<<8 | int(buffer[1])
 
+				// 长度校验（安全检查）
+				if length <= 0 || length > MaxUDPPacketSize {
+					logError("[UDP] 非法包长度 %d，关闭连接: %s", length, dstAddr)
+					return
+				}
+
 				// 检查是否有完整的数据包
 				if len(buffer) < 2+length {
 					// 数据不完整，等待更多数据
@@ -707,17 +716,28 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 
 				// 提取完整的 UDP 数据包
 				udpData := buffer[2 : 2+length]
-				if _, err := local.Write(udpData); err != nil {
-					logError("[UDP] 写回失败 %s: %v", dstAddr, err)
-					return
+				
+				// 完整写入（处理短写）
+				for len(udpData) > 0 {
+					n, err := local.Write(udpData)
+					if err != nil {
+						logError("[UDP] 写回失败 %s: %v", dstAddr, err)
+						return
+					}
+					udpData = udpData[n:]
 				}
 
 				// 移除已处理的数据包
 				buffer = buffer[2+length:]
 			}
 
+			// 释放已处理的内存（防止内存滞留）
+			if len(buffer) == 0 {
+				buffer = buffer[:0]
+			}
+
 			// 防止缓冲区无限增长
-			if len(buffer) > 65535 {
+			if len(buffer) > MaxUDPPacketSize+2 {
 				logError("[UDP] 缓冲区溢出，关闭连接: %s", dstAddr)
 				break
 			}
