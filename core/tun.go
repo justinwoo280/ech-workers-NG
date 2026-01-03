@@ -682,6 +682,8 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 	// tunnel TCP -> local UDP
 	go func() {
 		defer func() { done <- struct{}{} }()
+		buffer := make([]byte, 0, 65535) // 缓冲区，用于处理 TCP 流的粘包/拆包
+		
 		for {
 			// 读取数据
 			data, err := tunnelConn.Read()
@@ -689,24 +691,38 @@ func (t *TunEngine) forwardUDP(local *gonet.UDPConn, dstAddr string) {
 				break
 			}
 
-			// 解析长度前缀（2 字节）
-			if len(data) < 2 {
-				continue
+			// 追加到缓冲区
+			buffer = append(buffer, data...)
+
+			// 循环处理缓冲区中的所有完整数据包
+			for len(buffer) >= 2 {
+				// 读取长度前缀
+				length := int(buffer[0])<<8 | int(buffer[1])
+
+				// 检查是否有完整的数据包
+				if len(buffer) < 2+length {
+					// 数据不完整，等待更多数据
+					break
+				}
+
+				// 提取完整的 UDP 数据包
+				udpData := buffer[2 : 2+length]
+				if _, err := local.Write(udpData); err != nil {
+					logError("[UDP] 写回失败 %s: %v", dstAddr, err)
+					return
+				}
+
+				// 移除已处理的数据包
+				buffer = buffer[2+length:]
 			}
 
-			length := int(data[0])<<8 | int(data[1])
-
-			if len(data) < 2+length {
-				logError("[UDP] 数据包长度不匹配: 期望 %d, 实际 %d", length, len(data)-2)
-				continue
-			}
-
-			// 提取 UDP 数据并发送
-			if _, err := local.Write(data[2 : 2+length]); err != nil {
-				logError("[UDP] 写回失败 %s: %v", dstAddr, err)
+			// 防止缓冲区无限增长
+			if len(buffer) > 65535 {
+				logError("[UDP] 缓冲区溢出，关闭连接: %s", dstAddr)
 				break
 			}
 		}
+		logInfo("[UDP] 连接关闭: %s", dstAddr)
 	}()
 
 	// 等待任一方向结束
